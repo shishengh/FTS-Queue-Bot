@@ -1,0 +1,18 @@
+# 构建产物（从 Releases 下载，不入库）
+/dist/
+
+# 运行时在脚本所在目录生成的同名文件（只忽略根目录，别误伤 src/）
+/core.js
+/probe.js
+/logs/
+/wallets.json
+/config.json
+/node_modules/
+/package.json
+/package-lock.json
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,105 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'templates/**'
+      - 'build/**'
+      - 'VERSION'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: 构建单文件脚本
+        run: python3 build/build.py
+
+      - name: 校验 bash 语法
+        run: |
+          bash -n dist/autofts.sh
+          echo "bash 语法 OK"
+
+      - name: 校验 PowerShell 语法
+        shell: pwsh
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'dist/autofts.ps1'), [ref]$null, [ref]$errs) | Out-Null
+          if ($errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Error "行 $($_.Extent.StartLineNumber): $($_.Message)" }
+            exit 1
+          }
+          Write-Host "PowerShell 语法 OK"
+
+      - name: 校验内嵌引擎
+        run: |
+          node --version
+          node --check src/core.js
+          node --check src/probe.js
+          echo "引擎语法 OK"
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum autofts.sh autofts.ps1 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(tr -d ' \r\n' < VERSION)"
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，跳过创建"
+            exit 0
+          fi
+
+          cat > NOTES.md <<'EOF'
+          ## 下载
+
+          | 平台 | 文件 |
+          |---|---|
+          | Linux / Termux / macOS | `autofts.sh` |
+          | Windows | `autofts.ps1` |
+
+          两个脚本都是单文件，只需要 Node.js 18+。源码见 `src/`。
+
+          ## 首次使用
+
+          ```
+          --probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run
+          ```
+
+          `--probe` / `--selftest` 完全只读，不花一分钱。
+
+          ## 校验
+
+          ```
+          sha256sum -c SHA256SUMS.txt
+          ```
+          EOF
+
+          gh release create "$TAG" \
+            dist/autofts.sh \
+            dist/autofts.ps1 \
+            dist/SHA256SUMS.txt \
+            --title "$TAG" \
+            --notes-file NOTES.md
+
+          echo "已发布 $TAG"
