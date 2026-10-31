@@ -16,9 +16,6 @@ strip_bom() {
   [ -f "$1" ] || return 0
   node -e 'const fs=require("fs");const p=process.argv[1];let s=fs.readFileSync(p,"utf8");if(s.charCodeAt(0)===0xFEFF){fs.writeFileSync(p,s.slice(1),"utf8");console.log("已移除 BOM: "+p)}' "$1" 2>/dev/null || true
 }
-strip_bom config.json
-strip_bom wallets.json
-
 PID_FILE="$WORK_DIR/logs/engine.pid"
 STOP_FLAG="$WORK_DIR/logs/.stop"   # --stop 的"可靠信号": 即使 PID 丢失/被复用也能让外壳循环退出
 
@@ -122,20 +119,41 @@ stop_engine() {
   fi
   rm -f "$PID_FILE"
 
-  # 兜底(PID 文件丢失的情况)，Termux 原生可能没有 pkill，优先用 pgrep
+  # 兜底(PID 文件丢失的情况)
+  # 注意: MSYS/Git Bash 下 pgrep 看不到原生 node.exe，必须再退回解析 ps；
+  # 命令行里的路径可能是 /c/... 也可能是 C:/...，两种都要认。
+  _win_core=""
+  if command -v cygpath >/dev/null 2>&1; then
+    _win_core="$(cygpath -m "$WORK_DIR" 2>/dev/null)/core.js"
+  fi
+  _cands=""
   if command -v pgrep >/dev/null 2>&1; then
-    p="$(pgrep -f "$WORK_DIR/core.js" 2>/dev/null | tr '\n' ' ' || true)"
-    if [ -n "${p// /}" ]; then
-      # shellcheck disable=SC2086
-      kill -TERM $p 2>/dev/null
-      sleep 1
-      # shellcheck disable=SC2086
-      kill -KILL $p 2>/dev/null
-      echo "已停止运行中的引擎(PID: $p)"
-      found=1
+    _cands="$(pgrep -f "core\.js" 2>/dev/null || true)"
+  fi
+  if [ -z "${_cands// /}" ]; then
+    _cands="$(ps -ef 2>/dev/null | grep -i "core\.js" | grep -v grep | awk '{print $2}' || true)"
+  fi
+  p=""
+  for _pid in $_cands; do
+    _line="$(ps -ef 2>/dev/null | awk -v q="$_pid" '$2==q' || true)"
+    _ok=0
+    case "$_line" in *"$WORK_DIR/core.js"*) _ok=1 ;; esac
+    if [ "$_ok" = 0 ] && [ -n "$_win_core" ]; then
+      case "$_line" in *"$_win_core"*) _ok=1 ;; esac
     fi
-  elif command -v pkill >/dev/null 2>&1; then
-    if pkill -f "$WORK_DIR/core.js" 2>/dev/null; then echo "已停止运行中的引擎(pkill 兜底)"; found=1; fi
+    if [ "$_ok" = 0 ] && [ -r "/proc/$_pid/cwd" ]; then
+      [ "$(readlink -f "/proc/$_pid/cwd" 2>/dev/null)" = "$WORK_DIR" ] && _ok=1
+    fi
+    [ "$_ok" = 1 ] && p="$p $_pid"
+  done
+  if [ -n "${p// /}" ]; then
+    # shellcheck disable=SC2086
+    kill -TERM $p 2>/dev/null
+    sleep 1
+    # shellcheck disable=SC2086
+    kill -KILL $p 2>/dev/null
+    echo "已停止运行中的引擎(PID: $p)"
+    found=1
   fi
 
   if [ "$found" = 0 ]; then
@@ -184,6 +202,10 @@ if [ -z "${NODE_MAJOR:-}" ] || [ "$NODE_MAJOR" -lt 18 ]; then
 fi
 ok_msg "Node $(node -v) / npm $(npm -v 2>/dev/null || echo '?')"
 
+# node 确认可用之后再清 BOM（strip_bom 本身依赖 node）
+strip_bom config.json
+strip_bom wallets.json
+
 # --- ethers ---
 if ! node -e "require('ethers')" >/dev/null 2>&1; then
   echo "安装依赖 ethers@6 ..."
@@ -223,6 +245,10 @@ ok_msg "核心引擎 core.js + 只读探针 probe.js 已写入"
 # --probe 是纯只读探测，必须在"要求输入私钥"之前退出
 if [ "$MODE" = "probe" ]; then
   echo ""
+  # 防止把 --help 之类的开关当成合约地址传下去
+  case "$PROBE_ARGS" in
+    *--*|*-h*) warn_msg "probe 只接受 <合约地址> [钱包地址]，不要带 -- 参数"; PROBE_ARGS="" ;;
+  esac
   # shellcheck disable=SC2086
   node probe.js $PROBE_ARGS
   exit $?
@@ -249,7 +275,7 @@ wiz_load() {
       SNIPE_MIN_COUNT)  WIZ_MIN="$v" ;;
       SNIPE_MAX_COUNT)  WIZ_MAX="$v" ;;
       SNIPE_DELAY_MS)   WIZ_DELAY="$v" ;;
-      CLAIM_INTERVAL_MS) WIZ_CLAIM="$(( v / 1000 ))" ;;
+      CLAIM_INTERVAL_MS) WIZ_CLAIM="$(( v / 1000 ))"; [ "${WIZ_CLAIM:-0}" -lt 10 ] 2>/dev/null && WIZ_CLAIM=10 ;;
       MIN_BNB_GAS)      WIZ_BNB="$v" ;;
       GAS_MODE)         if [ "$v" = "auto" ]; then WIZ_GAS_MODE="auto"; else WIZ_GAS_MODE="fixed"; fi ;;
       GAS_GWEI)         WIZ_GAS_FIXED="$v"; WIZ_GAS_MODE="fixed" ;;
@@ -409,7 +435,7 @@ wiz_add_account() {
   echo "    ---- 添加账号 ----"
   [ -f wallets.json ] || echo '{"wallets": []}' > wallets.json
   while true; do
-    read -r -p "    私钥 (64位hex，可不带0x，输入不显示): " -s pk; echo
+    read -r -s -p "    私钥 (64位hex，可不带0x，输入不显示): " pk; echo
     pk="${pk#0x}"
     if [[ "$pk" =~ ^[0-9a-fA-F]{64}$ ]]; then break; fi
     warn_msg "私钥格式错误(必须是 64 位十六进制)"
@@ -630,6 +656,17 @@ cleanup() {
   echo ""
   echo "正在退出..."
   rm -f "$PID_FILE" "$STOP_FLAG"
+  # Ctrl-C 时 node 通常同进程组会一起收到 SIGINT，但如果它正卡在不响应信号的
+  # 调用里、或者 shell 用了 nohup/disown，就会变成孤儿进程继续跑、继续花钱。
+  # 所以这里必须显式回收它。
+  if [ -n "${NODE_PID:-}" ] && kill -0 "$NODE_PID" 2>/dev/null; then
+    kill -TERM "$NODE_PID" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$NODE_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -0 "$NODE_PID" 2>/dev/null && kill -KILL "$NODE_PID" 2>/dev/null
+  fi
   # 必须回收 tail，否则每次 --stop / Ctrl-C 都会漏一个常驻的 tail -f 进程
   [ -n "${TAIL_PID:-}" ] && kill "$TAIL_PID" 2>/dev/null
   TAIL_PID=""

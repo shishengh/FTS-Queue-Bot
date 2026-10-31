@@ -447,6 +447,7 @@ class BlockStream {
     this.tickCount = 0;
     // 去重改用"区块号"，不再用 800ms 时间窗(BSC 出块已降到 0.75s，时间窗会丢块)
     this.seenBlocks = new Set();
+    this.blockRetry = new Map();   // 块号 -> 状态读取失败次数
     this.pendingBlocks = [];      // 上一轮没查完时挂起，查完立刻补跑
     this.isReconnecting = false;  // 防止同时连出多条 WebSocket(幽灵连接)
     this.connecting = false;
@@ -593,7 +594,22 @@ class BlockStream {
         try {
           rooms = await getSharedState(h);
         } catch (e) {
-          errOnce('SYS', `读取区块 ${h} 状态失败: ${formatError(e)}`);
+          // 关键: 不能把失败当成"这个块处理过了"。tick 里已经 seenBlocks.add(h)，
+          // 如果这里直接 continue，WS 和轮询再送同一个块号都会被去重掉，
+          // 这个块的抢单窗口就永久丢了。这里退回 seenBlocks 并重排，最多重试 3 次。
+          const tries = (this.blockRetry.get(h) || 0) + 1;
+          this.blockRetry.set(h, tries);
+          if (this.blockRetry.size > 200) {
+            [...this.blockRetry.keys()].slice(0, 100).forEach(k => this.blockRetry.delete(k));
+          }
+          if (tries <= 3 && !this.stopped) {
+            this.seenBlocks.delete(h);           // 允许同块号再次进入
+            this.pendingBlocks.push(h);
+            warnOnce('SYS', `读取区块 ${h} 状态失败(第 ${tries} 次)，稍后重试: ${formatError(e).slice(0, 120)}`, 20000);
+            await sleep(300 * tries);
+          } else {
+            errOnce('SYS', `区块 ${h} 连续 ${tries} 次读取失败，放弃该块: ${formatError(e)}`, 30000);
+          }
           continue;
         }
         // 账号错峰用 setTimeout，不要 await sleep —— 否则 10 个账号光"睡觉"就 1.2s，
@@ -798,6 +814,9 @@ function confirmTxInBackground(inst, tx, opt, nonce) {
 // 用完全相同的 nonce + 更高 gas 重播原交易（内容不变，只换手续费）
 async function rebroadcastSameNonce(inst, tx, nonce) {
   if (DRY_RUN) return null;
+  // 广播必须和 sendTx / gapFixer 共用同一把 nonce 锁，
+  // 否则三者可能同时用同一个 nonce 发交易，互相覆盖
+  const release = await inst.mutex.acquire();
   try {
     const fee = await buildFeeParams(2);   // attempt=2 -> 1.3 倍加价
     const rep = await withTimeout(inst.wallet.sendTransaction({
@@ -812,6 +831,8 @@ async function rebroadcastSameNonce(inst, tx, nonce) {
   } catch (e) {
     warnOnce(inst.address, `同 nonce(${nonce}) 重播失败: ${formatError(e)}`, 60000);
     return null;
+  } finally {
+    release();
   }
 }
 
@@ -835,12 +856,18 @@ function startGapFixer(inst) {
       if (Date.now() - sameSince < CFG.GAP_STUCK_MS) return;    // 还没卡够久
       const stuck = Math.round((Date.now() - sameSince) / 1000);
       warn(inst.address, `nonce 疑似卡住: latest=${latest} pending=${pending} 已 ${stuck}s 未推进 -> 在 nonce=${latest} 补一笔 0 值自转填坑`);
-      const fee = await buildFeeParams(2);
-      const tx = await withTimeout(inst.wallet.sendTransaction({
-        to: inst.address, value: 0n, nonce: latest, gasLimit: 21000n, ...fee.tx
-      }), 30000, 'gapfill');
-      ok(inst.address, `填坑交易已广播: ${tx.hash} (nonce=${latest})`);
-      inst.nonce = null;      // 让后续交易重新读 pending，避免继续用错号
+      // 和 sendTx / 重播共用 nonce 锁，避免三方同时用同一 nonce 广播
+      const release = await inst.mutex.acquire();
+      try {
+        const fee = await buildFeeParams(2);
+        const tx = await withTimeout(inst.wallet.sendTransaction({
+          to: inst.address, value: 0n, nonce: latest, gasLimit: 21000n, ...fee.tx
+        }), 30000, 'gapfill');
+        ok(inst.address, `填坑交易已广播: ${tx.hash} (nonce=${latest})`);
+        inst.nonce = null;      // 让后续交易重新读 pending，避免继续用错号
+      } finally {
+        release();
+      }
       sameSince = Date.now();
     } catch (e) {
       warnOnce(inst.address, `nonce 巡检失败: ${formatError(e)}`, 60000);
@@ -1141,9 +1168,14 @@ async function claimLoop(inst) {
             await mgr.rpc(p => inst.queue.claimRefundAndAirdrop.staticCall(room, r, { from: inst.address }));
           } catch (e) {
             claimable = false;
-            // 终态轮次(非进行中)不可领 -> 永久标记，避免每轮重复预检
-            // 进行中的轮次状态还会变，现在不可领不代表以后不可领，必须保留重试，否则漏退款
-            if (rec.state !== 0) inst.claimed.add(ck);
+            // 关键: 只有"合约明确拒绝"(revert) 才能永久跳过。
+            // 节点超时 / 429 / 网络抖动 属于软失败，一旦标记永久，这个账号就
+            // 永远漏掉这笔退款/空投了，而且没有任何补救机会。
+            const hardFail = e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null;
+            if (hardFail && rec.state !== 0) inst.claimed.add(ck);
+            else if (!hardFail) {
+              warnOnce(inst.address, `[房间${room}] 轮次${r} 预检遇到网络问题，稍后重试(不标记已领): ${formatError(e).slice(0, 120)}`, 60000);
+            }
           }
           if (!claimable) continue;
 

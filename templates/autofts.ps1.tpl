@@ -115,11 +115,17 @@ function Stop-Engine {
         }
     }
 
-    # PID 复用防护: 校验命令行里确实有本脚本
+    # PID 复用防护: 必须能读到命令行、且确实是本脚本，才敢 kill。
+    # 读不到命令行时(权限/CIM 异常)宁可不动手 —— PID 复用误杀别的进程，
+    # 比 --stop 少停一次严重得多。
     $shellOk = $false
     if ($shellPid -gt 0 -and (Get-Process -Id $shellPid -ErrorAction SilentlyContinue)) {
         $ci = Get-CimInstance Win32_Process -Filter "ProcessId=$shellPid" -ErrorAction SilentlyContinue
-        if (-not $ci -or -not $ci.CommandLine -or $ci.CommandLine -match 'autofts') { $shellOk = $true }
+        if ($ci -and $ci.CommandLine) {
+            if ($ci.CommandLine -match 'autofts') { $shellOk = $true }
+        } else {
+            Write-WarnMsg "无法校验 PID $shellPid 的命令行，跳过外壳进程(避免 PID 复用误杀)"
+        }
     }
     if ($shellOk) {
         Stop-Process -Id $shellPid -Force -ErrorAction SilentlyContinue
@@ -127,9 +133,22 @@ function Stop-Engine {
         $found = $true
     }
     if ($nodePid -gt 0 -and (Get-Process -Id $nodePid -ErrorAction SilentlyContinue)) {
-        Stop-Process -Id $nodePid -Force -ErrorAction SilentlyContinue
-        Write-Host "已停止引擎 (PID $nodePid)"
-        $found = $true
+        $corePathCheck = Join-Path $Script:WorkDir 'core.js'
+        $ciNode = Get-CimInstance Win32_Process -Filter "ProcessId=$nodePid" -ErrorAction SilentlyContinue
+        if (-not $ciNode -or -not $ciNode.CommandLine -or $ciNode.CommandLine -like "*$corePathCheck*") {
+            if ($ciNode -and $ciNode.CommandLine) {
+                Stop-Process -Id $nodePid -Force -ErrorAction SilentlyContinue
+                Write-Host "已停止引擎 (PID $nodePid)"
+                $found = $true
+            } elseif (-not $ciNode) {
+                # 读不到进程信息：可能是权限问题，保守跳过
+                Write-WarnMsg "无法校验引擎 PID $nodePid，跳过(可用任务管理器手动结束)"
+            } else {
+                Stop-Process -Id $nodePid -Force -ErrorAction SilentlyContinue
+                Write-Host "已停止引擎 (PID $nodePid)"
+                $found = $true
+            }
+        }
     }
     Remove-Item -LiteralPath $Script:PidFile -Force -ErrorAction SilentlyContinue
 
@@ -325,7 +344,10 @@ put("GAS_MULT",c.GAS_MULT);
                 'SNIPE_MIN_COUNT'   { $Script:WizMin = $v }
                 'SNIPE_MAX_COUNT'   { $Script:WizMax = $v }
                 'SNIPE_DELAY_MS'    { $Script:WizDelay = $v }
-                'CLAIM_INTERVAL_MS' { $Script:WizClaim = [string][int]([double]$v / 1000) }
+                'CLAIM_INTERVAL_MS' {
+                    # config.json 被手改成非法值时不能把整个向导搞崩
+                    try { $Script:WizClaim = [string][int]([double]$v / 1000) } catch { }
+                }
                 'MIN_BNB_GAS'       { $Script:WizBnb = $v }
                 'GAS_MODE'          { if ($v -eq 'auto') { $Script:WizGasMode = 'auto' } else { $Script:WizGasMode = 'fixed' } }
                 'GAS_GWEI'          { $Script:WizGasFixed = $v; $Script:WizGasMode = 'fixed' }
@@ -480,7 +502,9 @@ function Add-Account {
     while ($true) {
         $sec = Read-Host "    私钥 (64位hex，可不带0x，输入不显示)" -AsSecureString
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-        try { $pk = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        # SecureString 内部是 UTF-16，必须用 PtrToStringBSTR；
+        # PtrToStringAuto 依赖系统 ANSI/Unicode 模式，跨机器可能解出乱码
+        try { $pk = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
         $pk = "$pk".Trim()
         if ($pk -match '^0x') { $pk = $pk.Substring(2) }
         if ($pk -match '^[0-9a-fA-F]{64}$') { break }
