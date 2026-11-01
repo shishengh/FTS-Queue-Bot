@@ -234,7 +234,16 @@ async function pickRpc() {
   }
   let curVal = null;
   if (curRaw) { try { curVal = BigInt('0x' + curRaw.slice(2, 66)); } catch (e) { } }
-  await readRaw(`roundInfo(0, ${curVal === null ? '?' : curVal})`, infoSig, nParams(infoSig) === 0 ? [] : (nParams(infoSig) === 1 ? [0] : [0, curVal === null ? 1 : curVal]));
+  // 候选签名里可能有 3 个参数的变体(roundInfo(uint8,uint256,address))，
+  // 类型未知没法瞎补参数，参数个数对不上就直接跳过这条候选，别让它抛 ABI 编码错误
+  const infoArgCount = nParams(infoSig);
+  if (infoArgCount <= 2) {
+    const infoArgs = infoArgCount === 0 ? []
+      : (infoArgCount === 1 ? [0] : [0, curVal === null ? 1 : curVal]);
+    await readRaw(`roundInfo(0, ${curVal === null ? '?' : curVal})`, infoSig, infoArgs);
+  } else {
+    console.log('  ○ roundInfo 候选参数过多，跳过');
+  }
 
   // ---------- 6. USDT ----------
   console.log(B + '\n--- 6. USDT 合约 ---' + D);

@@ -80,7 +80,8 @@ trap on_exit EXIT INT TERM
 stop_engine() {
   # 关键: 必须先停"外壳 while 循环"，再停 node。
   # 只停 node 的话，外壳会以为程序崩了，几秒后又把 node 拉起来(--stop 停不下来的根因)。
-  local node_pid="" shell_pid="" found=0 p cl=""
+  local node_pid="" shell_pid="" found=0 p=""
+  local _win_core="" _cands="" _pid="" _line="" _ok=0
 
   # 0) 先落"停止标志"。外壳循环每轮开头都会检查它，
   #    这样即使 PID 文件丢了 / PID 被复用 / 没有 pgrep，也一定能停下来。
@@ -275,7 +276,13 @@ wiz_load() {
       SNIPE_MIN_COUNT)  WIZ_MIN="$v" ;;
       SNIPE_MAX_COUNT)  WIZ_MAX="$v" ;;
       SNIPE_DELAY_MS)   WIZ_DELAY="$v" ;;
-      CLAIM_INTERVAL_MS) WIZ_CLAIM="$(( v / 1000 ))"; [ "${WIZ_CLAIM:-0}" -lt 10 ] 2>/dev/null && WIZ_CLAIM=10 ;;
+      # 注意: $(( v / 1000 )) 遇到 "abc" 会当成变量名，set -u 下直接 unbound，
+      # 所以必须先确认是纯数字再算
+      CLAIM_INTERVAL_MS)
+        if [[ "$v" =~ ^[0-9]+$ ]]; then
+          WIZ_CLAIM="$(( v / 1000 ))"
+          [ "$WIZ_CLAIM" -lt 10 ] && WIZ_CLAIM=10
+        fi ;;
       MIN_BNB_GAS)      WIZ_BNB="$v" ;;
       GAS_MODE)         if [ "$v" = "auto" ]; then WIZ_GAS_MODE="auto"; else WIZ_GAS_MODE="fixed"; fi ;;
       GAS_GWEI)         WIZ_GAS_FIXED="$v"; WIZ_GAS_MODE="fixed" ;;
@@ -299,6 +306,19 @@ wiz_load() {
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=30
+
+  # 手改 config.json 写成 "abc" 时，后面的 [ -ge ] 会报 integer expression expected，
+  # 向导的默认值也会变成非法值。这里统一兜一道，非法就回默认。
+  _is_num() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+  _is_num "$WIZ_MIN"       || WIZ_MIN=30
+  _is_num "$WIZ_MAX"       || WIZ_MAX=60
+  _is_num "$WIZ_DELAY"     || WIZ_DELAY=0
+  _is_num "$WIZ_CLAIM"     || WIZ_CLAIM=30
+  _is_num "$WIZ_BNB"       || WIZ_BNB=0.005
+  _is_num "$WIZ_GAS_MAX"   || WIZ_GAS_MAX=10
+  _is_num "$WIZ_GAS_MULT"  || WIZ_GAS_MULT=1.25
+  _is_num "$WIZ_GAS_FIXED" || WIZ_GAS_FIXED=0.05
+  [[ "$WIZ_ROOMS" =~ ^[0-2](,[0-2])*$ ]] || WIZ_ROOMS="0,1,2"
 }
 
 wiz_rooms_text() {
@@ -715,6 +735,7 @@ while [ "$RUNNING" = 1 ]; do
   TAIL_PID=$!
   wait "$NODE_PID"
   CODE=$?
+  NODE_PID=""   # node 已退出，清掉它；否则 sleep 期间 Ctrl-C 可能 kill 到被复用的 PID
   kill "$TAIL_PID" 2>/dev/null
   TAIL_PID=""
   rm -f "$PID_FILE"

@@ -600,7 +600,9 @@ class BlockStream {
           const tries = (this.blockRetry.get(h) || 0) + 1;
           this.blockRetry.set(h, tries);
           if (this.blockRetry.size > 200) {
-            [...this.blockRetry.keys()].slice(0, 100).forEach(k => this.blockRetry.delete(k));
+            // 按块号淘汰(块号单调递增)。不能按插入顺序删 —— 那可能把还在重试中的块
+            // 删掉，计数归零后又白送 3 次机会，极端情况下会无限重试
+            for (const k of this.blockRetry.keys()) { if (k < h - 200) this.blockRetry.delete(k); }
           }
           if (tries <= 3 && !this.stopped) {
             this.seenBlocks.delete(h);           // 允许同块号再次进入

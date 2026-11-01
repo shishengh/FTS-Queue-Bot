@@ -135,19 +135,14 @@ function Stop-Engine {
     if ($nodePid -gt 0 -and (Get-Process -Id $nodePid -ErrorAction SilentlyContinue)) {
         $corePathCheck = Join-Path $Script:WorkDir 'core.js'
         $ciNode = Get-CimInstance Win32_Process -Filter "ProcessId=$nodePid" -ErrorAction SilentlyContinue
-        if (-not $ciNode -or -not $ciNode.CommandLine -or $ciNode.CommandLine -like "*$corePathCheck*") {
-            if ($ciNode -and $ciNode.CommandLine) {
-                Stop-Process -Id $nodePid -Force -ErrorAction SilentlyContinue
-                Write-Host "已停止引擎 (PID $nodePid)"
-                $found = $true
-            } elseif (-not $ciNode) {
-                # 读不到进程信息：可能是权限问题，保守跳过
-                Write-WarnMsg "无法校验引擎 PID $nodePid，跳过(可用任务管理器手动结束)"
-            } else {
-                Stop-Process -Id $nodePid -Force -ErrorAction SilentlyContinue
-                Write-Host "已停止引擎 (PID $nodePid)"
-                $found = $true
-            }
+        # 只有"能读到命令行、且确实是本目录的 core.js"才动手。
+        # 读不到命令行(进程已退出 / 权限不足)一律跳过 —— 和外壳进程同一套标准。
+        if ($ciNode -and $ciNode.CommandLine -and $ciNode.CommandLine -like "*$corePathCheck*") {
+            Stop-Process -Id $nodePid -Force -ErrorAction SilentlyContinue
+            Write-Host "已停止引擎 (PID $nodePid)"
+            $found = $true
+        } else {
+            Write-WarnMsg "无法校验引擎 PID $nodePid 的命令行，跳过(可用任务管理器手动结束)"
         }
     }
     Remove-Item -LiteralPath $Script:PidFile -Force -ErrorAction SilentlyContinue
@@ -303,6 +298,11 @@ Write-Ok "核心引擎 core.js + 只读探针 probe.js 已写入"
 
 # --probe 是纯只读探测，必须在"要求输入私钥"之前退出
 if ($Mode -eq 'probe') {
+    # 和 bash 版对齐: 别把 --help 之类的开关当成合约地址传给 probe.js
+    if ($ProbeArgs -and ($ProbeArgs | Where-Object { "$_" -like '-*' })) {
+        Write-WarnMsg "probe 只接受 <合约地址> [钱包地址]，不要带 -- 参数"
+        $ProbeArgs = @()
+    }
     Write-Host ""
     & $Script:NodeExe probe.js @ProbeArgs
     exit $LASTEXITCODE
@@ -316,6 +316,10 @@ if ($Mode -eq 'probe') {
 $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
 $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
+
+# 手改 config.json 写成 "abc" 时，后面的 [int] 转换会抛异常把整个向导搞崩。
+# 统一在这里挡一道: 不是合法数字就保留默认值。
+function Test-IsNum { param([string]$v) return ($v -match '^[0-9]+([.][0-9]+)?$') }
 
 function Load-Wiz {
     if (-not (Test-Path -LiteralPath 'config.json')) { return }
@@ -340,19 +344,19 @@ put("GAS_MULT",c.GAS_MULT);
         if ($l -match '^([A-Z_]+)=(.*)$') {
             $k = $Matches[1]; $v = $Matches[2]
             switch ($k) {
-                'ROOMS'             { $Script:WizRooms = $v }
-                'SNIPE_MIN_COUNT'   { $Script:WizMin = $v }
-                'SNIPE_MAX_COUNT'   { $Script:WizMax = $v }
-                'SNIPE_DELAY_MS'    { $Script:WizDelay = $v }
+                'ROOMS'             { if ($v -match '^[0-2](,[0-2])*$') { $Script:WizRooms = $v } }
+                'SNIPE_MIN_COUNT'   { if (Test-IsNum $v) { $Script:WizMin = $v } }
+                'SNIPE_MAX_COUNT'   { if (Test-IsNum $v) { $Script:WizMax = $v } }
+                'SNIPE_DELAY_MS'    { if (Test-IsNum $v) { $Script:WizDelay = $v } }
                 'CLAIM_INTERVAL_MS' {
                     # config.json 被手改成非法值时不能把整个向导搞崩
                     try { $Script:WizClaim = [string][int]([double]$v / 1000) } catch { }
                 }
-                'MIN_BNB_GAS'       { $Script:WizBnb = $v }
+                'MIN_BNB_GAS'       { if (Test-IsNum $v) { $Script:WizBnb = $v } }
                 'GAS_MODE'          { if ($v -eq 'auto') { $Script:WizGasMode = 'auto' } else { $Script:WizGasMode = 'fixed' } }
-                'GAS_GWEI'          { $Script:WizGasFixed = $v; $Script:WizGasMode = 'fixed' }
-                'GAS_MAX_GWEI'      { $Script:WizGasMax = $v }
-                'GAS_MULT'          { $Script:WizGasMult = $v }
+                'GAS_GWEI'          { if (Test-IsNum $v) { $Script:WizGasFixed = $v; $Script:WizGasMode = 'fixed' } }
+                'GAS_MAX_GWEI'      { if (Test-IsNum $v) { $Script:WizGasMax = $v } }
+                'GAS_MULT'          { if (Test-IsNum $v) { $Script:WizGasMult = $v } }
             }
         }
     }
@@ -767,6 +771,9 @@ while ($running) {
         $proc.StartInfo = $psi
         $null = $proc.Start()
         Set-Content -LiteralPath $Script:PidFile -Value @("shell=$PID", "node=$($proc.Id)") -Encoding ASCII -ErrorAction SilentlyContinue
+        # 注: Ctrl-C 时 Windows 会给整个控制台进程组发 CTRL_C_EVENT，
+        # node 收到后会自己退出，所以这里不额外注册 CancelKeyPress
+        # （PS 里那个事件在后台线程跑，脚本块不可靠，收益不抵风险）。
         $proc.WaitForExit()
         $code = $proc.ExitCode
     } catch {
