@@ -316,6 +316,7 @@ if ($Mode -eq 'probe') {
 $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
 $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
+$Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 
 # 手改 config.json 写成 "abc" 时，后面的 [int] 转换会抛异常把整个向导搞崩。
 # 统一在这里挡一道: 不是合法数字就保留默认值。
@@ -384,11 +385,12 @@ function Get-GasText {
 }
 
 function Get-AccountCount {
-    if (-not (Test-Path -LiteralPath 'wallets.json')) { return 0 }
+    if ($Script:WizAccountCount -ge 0) { return $Script:WizAccountCount }
+    if (-not (Test-Path -LiteralPath 'wallets.json')) { $Script:WizAccountCount = 0; return 0 }
     $code = 'try{const d=JSON.parse(require("fs").readFileSync("wallets.json","utf8"));console.log((d.wallets||[]).length)}catch(e){console.log(0)}'
     $n = Invoke-NodeJs 'acc-count' $code
-    if ("$n" -match '^\d+$') { return [int]$n }
-    return 0
+    if ("$n" -match '^\d+$') { $Script:WizAccountCount = [int]$n } else { $Script:WizAccountCount = 0 }
+    return $Script:WizAccountCount
 }
 
 function Show-WizHeader {
@@ -503,13 +505,20 @@ function Add-Account {
     if (-not (Test-Path -LiteralPath 'wallets.json')) { Set-Content -LiteralPath 'wallets.json' -Value '{"wallets": []}' -Encoding ASCII }
 
     $pk = ''
+    # 注意: Read-Host -AsSecureString 在 stdin 被重定向时(管道/文件)会永久挂起，
+    # 既不报错也不返回。所以重定向时退回普通 Read-Host —— 反正没有回显。
+    $pipeMode = [Console]::IsInputRedirected
     while ($true) {
-        $sec = Read-Host "    私钥 (64位hex，可不带0x，输入不显示)" -AsSecureString
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-        # SecureString 内部是 UTF-16，必须用 PtrToStringBSTR；
-        # PtrToStringAuto 依赖系统 ANSI/Unicode 模式，跨机器可能解出乱码
-        try { $pk = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-        $pk = "$pk".Trim()
+        if ($pipeMode) {
+            $pk = "$(Read-Host '    私钥 (64位hex，可不带0x)')".Trim()
+        } else {
+            $sec = Read-Host "    私钥 (64位hex，可不带0x，输入不显示)" -AsSecureString
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+            # SecureString 内部是 UTF-16，必须用 PtrToStringBSTR；
+            # PtrToStringAuto 依赖系统 ANSI/Unicode 模式，跨机器可能解出乱码
+            try { $pk = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+            $pk = "$pk".Trim()
+        }
         if ($pk -match '^0x') { $pk = $pk.Substring(2) }
         if ($pk -match '^[0-9a-fA-F]{64}$') { break }
         Write-WarnMsg "私钥格式错误(必须是 64 位十六进制)"
@@ -548,6 +557,7 @@ fs.renameSync(tmp,"wallets.json");
         Start-Sleep -Seconds 1
         return
     }
+    $Script:WizAccountCount = -1    # 账号变了，缓存失效
     Write-Ok "账号 $addr 已添加"
     Start-Sleep -Seconds 1
 }
@@ -556,6 +566,7 @@ function Clear-Accounts {
     $a = Read-Host "    确认清空全部账号? 不可恢复 (y/N)"
     if ($a -match '^[Yy]') {
         Set-Content -LiteralPath 'wallets.json' -Value '{"wallets": []}' -Encoding ASCII
+        $Script:WizAccountCount = -1    # 账号变了，缓存失效
         Write-Ok "已清空"
     } else {
         Write-Host "    已取消"

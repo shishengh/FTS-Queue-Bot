@@ -701,8 +701,7 @@ async function ensureFunds(inst, ticketPrice, room) {
     label: `[${tag}] USDT 授权 ${ethers.formatUnits(target, 18)}`,
     contract: inst.usdt,
     method: 'approve',
-    args: [CFG.QUEUE_ADDR, target],
-    critical: true
+    args: [CFG.QUEUE_ADDR, target]
   });
   if (!okTx) {
     err(inst.address, `[${tag}] 授权失败，本轮放弃入场(不会扣款)。常见原因: 钱包 USDT 为 0 / BNB 不够 gas / 合约暂停 / 节点广播失败`);

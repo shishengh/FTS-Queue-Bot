@@ -229,8 +229,15 @@ async function pickRpc() {
 
   const curRaw = await readRaw('currentRound(0)', curSig, nParams(curSig) === 0 ? [] : [0]);
   // 逐个房间查票价(0=10U 1=50U 2=100U)，哪个房间在链上存在、票价多少，一眼看清
-  for (const room of [0, 1, 2]) {
-    await readRaw(`roomConfigs(${room})`, roomSig, nParams(roomSig) === 0 ? [] : [room]);
+  // 候选里还有 roomConfigs(uint8,uint256) 这种 2 参数变体，只传一个参数会抛 ABI 编码错，
+  // 和 roundInfo 一样处理: 参数个数对不上就跳过，别让它变成一行看不懂的 ❌
+  const roomArgCount = nParams(roomSig);
+  if (roomArgCount > 1) {
+    console.log(`  ○ roomConfigs 候选(${roomSig})参数过多，跳过`);
+  } else {
+    for (const room of [0, 1, 2]) {
+      await readRaw(`roomConfigs(${room})`, roomSig, roomArgCount === 0 ? [] : [room]);
+    }
   }
   let curVal = null;
   if (curRaw) { try { curVal = BigInt('0x' + curRaw.slice(2, 66)); } catch (e) { } }
