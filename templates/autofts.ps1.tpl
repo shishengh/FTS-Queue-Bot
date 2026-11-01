@@ -68,17 +68,29 @@ function Set-FileAcl {
     if (-not (Test-Path -LiteralPath $f)) { return }
     try {
         $acl = Get-Acl -LiteralPath $f
-        $acl.SetAccessRuleProtection($true, $false)   # 断开继承并清空继承来的规则
-        # 只留"当前用户 + SYSTEM + Administrators"这三个。
-        # 不能只留当前用户: 备份(VSS)、杀软、管理员运维都读不到文件，属于安全过头。
-        # 用 SID 而不是名字，避免中文系统 / 非英文 locale 下匹配不到。
-        $ids = @(
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
-            (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')),
-            (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))
+        # 目标: 当前用户 + SYSTEM + Administrators 三个，其他(Everyone/Users)一律去掉。
+        # 不能只留当前用户: 备份(VSS)、杀软、管理员运维都读不到，属于安全过头。
+        # 用 SID 比较，避免中文系统 / 非英文 locale 下名字对不上。
+        $want = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+            'S-1-5-18',      # SYSTEM
+            'S-1-5-32-544'   # Administrators
         )
-        foreach ($id in $ids) {
-            $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', 'Allow')))
+        # IdentityReference 通常是 NTAccount(名字)，要 Translate 成 SID 才能和 $want 比
+        $have = @($acl.Access | ForEach-Object {
+            try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+            catch { $_.IdentityReference.Value }
+        })
+        # 已经断过继承、且这三个都在，就别再动: 用户可能手动加过审计/备份用的 ACE，
+        # 每次启动都重设会把它们打掉
+        if ($acl.AreAccessRulesProtected) {
+            $missing = @($want | Where-Object { $have -notcontains $_ })
+            if ($missing.Count -eq 0) { return }
+        }
+        $acl.SetAccessRuleProtection($true, $false)   # 断开继承并清空继承来的规则
+        foreach ($sid in $want) {
+            $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'Allow')))
         }
         Set-Acl -LiteralPath $f -AclObject $acl
     } catch {
@@ -481,7 +493,7 @@ function Show-WizHeader {
 function Ask-Int {
     param([string]$Prompt, [string]$Default, [int]$Min, [int]$Max)
     while ($true) {
-        $v = Read-Host "    $Prompt [$Default]"
+        $v = Read-Menu "    $Prompt [$Default]"
         if ([string]::IsNullOrWhiteSpace($v)) { $v = $Default }
         $n = 0
         if (-not [int]::TryParse($v, [ref]$n)) { Write-WarnMsg "请输入整数"; continue }
@@ -494,7 +506,7 @@ function Ask-Dec {
     param([string]$Prompt, [string]$Default, [double]$Min, [double]$Max)
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     while ($true) {
-        $v = Read-Host "    $Prompt [$Default]"
+        $v = Read-Menu "    $Prompt [$Default]"
         if ([string]::IsNullOrWhiteSpace($v)) { $v = $Default }
         if ($v -notmatch '^\d+(\.\d+)?$') { Write-WarnMsg "请输入数字(小数点用 .)"; continue }
         $d = 0.0
@@ -509,7 +521,7 @@ function Edit-Rooms {
     Write-Host "    选择参与的房间(可多选，逗号分隔)"
     Write-Host "      0 = 10U    1 = 50U    2 = 100U"
     Write-Host "    当前: $($Script:WizRooms)"
-    $v = Read-Host "    请输入(如 0 或 0,1)"
+    $v = Read-Menu "    请输入(如 0 或 0,1)"
     if ([string]::IsNullOrWhiteSpace($v)) { $v = $Script:WizRooms }
     $v = $v -replace '\s', ''
     if ($v -notmatch '^[0-2](,[0-2])*$') { Write-WarnMsg "只能填 0/1/2，用英文逗号分隔"; Start-Sleep -Seconds 1; return }
@@ -541,7 +553,7 @@ function Edit-Gas {
     Write-Host "      [1] 固定 gas 价(默认 0.05 gwei，每笔都按这个价发)"
     Write-Host "      [2] 自动: 按链上实时价上浮，并设上限保护"
     Write-Host "    当前: $(Get-GasText)"
-    $ch = Read-Host "    请选择 [1/2]"
+    $ch = Read-Menu "    请选择 [1/2]"
     if ($ch -eq '2') {
         $Script:WizGasMult = Ask-Dec "上浮倍数(相对链上实时价)" $Script:WizGasMult 1 5
         $Script:WizGasMax  = Ask-Dec "gas 上限 (gwei，防止拥堵时被扣爆)" $Script:WizGasMax 0.5 200
@@ -589,7 +601,7 @@ function Add-Account {
             try { $pk = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
             $pk = "$pk".Trim()
         }
-        if ([string]::IsNullOrWhiteSpace($pk)) {
+        if ($pipeMode -and [string]::IsNullOrWhiteSpace($pk)) {
             $eof++
             if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
         } else { $eof = 0 }
@@ -600,7 +612,7 @@ function Add-Account {
     $addr = ''
     while ($true) {
         $addr = "$(Read-Host '    钱包地址 (0x开头)')".Trim()
-        if ([string]::IsNullOrWhiteSpace($addr)) {
+        if ($pipeMode -and [string]::IsNullOrWhiteSpace($addr)) {
             $eof++
             if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
         } else { $eof = 0 }
@@ -610,7 +622,7 @@ function Add-Account {
     $ref = ''
     while ($true) {
         $ref = "$(Read-Host '    推荐人地址 (0x开头)')".Trim()
-        if ([string]::IsNullOrWhiteSpace($ref)) {
+        if ($pipeMode -and [string]::IsNullOrWhiteSpace($ref)) {
             $eof++
             if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
         } else { $eof = 0 }
@@ -645,7 +657,7 @@ try { fs.renameSync(tmp,"wallets.json"); } finally { if (fs.existsSync(tmp)) { t
 }
 
 function Clear-Accounts {
-    $a = Read-Host "    确认清空全部账号? 不可恢复 (y/N)"
+    $a = Read-Menu "    确认清空全部账号? 不可恢复 (y/N)"
     if ($a -match '^[Yy]') {
         Set-Content -LiteralPath 'wallets.json' -Value '{"wallets": []}' -Encoding ASCII
         $Script:WizAccountCount = -1    # 账号变了，缓存失效
@@ -680,7 +692,7 @@ function Show-Accounts {
 }
 
 function Reset-Defaults {
-    $a = Read-Host "    恢复全部设置为默认值? (y/N)"
+    $a = Read-Menu "    恢复全部设置为默认值? (y/N)"
     if ($a -match '^[Yy]') {
         $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
         $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
@@ -741,7 +753,7 @@ try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { tr
     if ("$ov" -match '^\d+$' -and [int]$ov -gt 0) {
         Write-Host ""
         Write-WarnMsg "有 $ov 个账号带独立抢位设置，会覆盖上面的全局值"
-        $a = Read-Host "    改为统一使用全局设置? (Y/n)"
+        $a = Read-Menu "    改为统一使用全局设置? (Y/n)"
         if ($a -notmatch '^[Nn]') {
             $strip = @'
 const fs=require("fs");

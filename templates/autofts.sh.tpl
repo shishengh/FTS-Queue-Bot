@@ -576,7 +576,9 @@ wiz_commit() {
     else c.GAS_GWEI = null;
     const tmp = "config.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(c, null, 2) + "\n");
-    fs.renameSync(tmp, "config.json");
+    // rename 失败时清掉 .tmp，别在目录里留垃圾
+    try { fs.renameSync(tmp, "config.json"); }
+    finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
   ' || { warn_msg "写入 config.json 失败"; sleep 1; return 1; }
 
   # 老版本会在每个账号里存 SNIPE_MIN/MAX/DELAY，它们会覆盖全局设置 -> 提示统一
@@ -598,7 +600,9 @@ wiz_commit() {
         d.wallets.forEach(w => { delete w.SNIPE_MIN_COUNT; delete w.SNIPE_MAX_COUNT; delete w.SNIPE_DELAY_MS; });
         const tmp = "wallets.json.tmp";
         fs.writeFileSync(tmp, JSON.stringify(d, null, 2), { mode: 0o600 });
-        fs.renameSync(tmp, "wallets.json");
+        // rename 失败时清掉 .tmp：Git Bash on Windows 上 chmod 无效，残留就是明文私钥
+        try { fs.renameSync(tmp, "wallets.json"); }
+        finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
       ' && ok_msg "已统一为全局设置" ;;
     esac
   fi

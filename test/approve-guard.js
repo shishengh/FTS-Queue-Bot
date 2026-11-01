@@ -84,6 +84,11 @@ Object.assign(CFG, baseCfg(), { APPROVE_USD: 100 });
 makeValidate()();
 check('APPROVE_USD=100 保持不变', CFG.APPROVE_USD === 100, `实际 ${CFG.APPROVE_USD}`);
 
+// String(1e-7) 是 "1e-7"，用"字符串里有 e"判断会误伤；这里必须保持不变
+Object.assign(CFG, baseCfg(), { APPROVE_USD: 0.0000001 });
+makeValidate()();
+check('APPROVE_USD=1e-7 不被误判(保持原值)', CFG.APPROVE_USD === 0.0000001, `实际 ${CFG.APPROVE_USD}`);
+
 // ============ 2. ensureFunds 不抛异常 ============
 console.log('\n--- ensureFunds ---');
 
@@ -120,7 +125,8 @@ function makeEnsure(cfg) {
     ['APPROVE_ROUNDS=1.5', { APPROVE_ROUNDS: 1.5, APPROVE_USD: null }, TICKET],
     ['APPROVE_USD=1e30', { APPROVE_ROUNDS: 1, APPROVE_USD: 1e30 }, TICKET],
     ['APPROVE_USD=-5', { APPROVE_ROUNDS: 1, APPROVE_USD: -5 }, TICKET],
-    ['APPROVE_USD=100', { APPROVE_ROUNDS: 1, APPROVE_USD: 100 }, ethers.parseUnits('100', 18)]
+    ['APPROVE_USD=100', { APPROVE_ROUNDS: 1, APPROVE_USD: 100 }, ethers.parseUnits('100', 18)],
+    ['APPROVE_USD=1e-7', { APPROVE_ROUNDS: 1, APPROVE_USD: 0.0000001 }, TICKET]
   ];
 
   for (const [name, cfg, expect] of cases) {

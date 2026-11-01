@@ -197,9 +197,10 @@ function validateCfg() {
     if (!(CFG.APPROVE_USD >= 0)) {
       p.push(`APPROVE_USD(${CFG.APPROVE_USD}) 不能为负，已改回自动(一轮票价)`);
       CFG.APPROVE_USD = null;
-    } else if (String(CFG.APPROVE_USD).indexOf('e') >= 0 || String(CFG.APPROVE_USD).indexOf('E') >= 0) {
-      // 不能只比 1e21: Number 精度下 1e21 附近 String() 就已经变成 "1e+21" 了，
-      // 直接看字符串里有没有科学计数法的 e 更准
+    } else if (CFG.APPROVE_USD >= 1e21) {
+      // 1e21 及以上 String() 会变成 "1e+21" 这种科学计数法，parseUnits 直接不认。
+      // 注意不要用"字符串里有没有 e"来判断: String(0.0000001) 是 "1e-7"，会误伤小数。
+      // 而 1e21-1 在 Number 精度下就等于 1e21，所以 >= 1e21 已经覆盖了边界。
       p.push(`APPROVE_USD(${CFG.APPROVE_USD}) 过大(会被转成科学计数法而无法解析)，已改回自动(一轮票价)`);
       CFG.APPROVE_USD = null;
     }
@@ -1285,7 +1286,7 @@ async function selftest() {
   console.log(`WS 可用: ${ensureWebSocket()} | 队列合约: ${CFG.QUEUE_ADDR} | USDT: ${CFG.USDT_ADDR}`);
 
   console.log('\n--- 1. RPC 节点探测 ---');
-  try { await mgr.pickBest(); } catch (e) { fatal('SYS', formatError(e)); process.exit(1); }
+  try { await mgr.pickBest(); } catch (e) { fatal('SYS', formatError(e)); exitFlush(1); return; }
 
   console.log('\n--- 2. 合约存在性 ---');
   for (const [name, addr] of [['QUEUE', CFG.QUEUE_ADDR], ['USDT', CFG.USDT_ADDR]]) {
@@ -1353,7 +1354,7 @@ async function selftest() {
   console.log('\n--- 4. 账号检查 ---');
   // 复用 main 已经加载好的钱包列表，不再重复 loadWallets()(否则校验失败信息会打印两遍)
   const wallets = selftestWallets;
-  if (!wallets.length) { fatal('CFG', 'wallets.json 中没有有效账号'); process.exit(1); }
+  if (!wallets.length) { fatal('CFG', 'wallets.json 中没有有效账号'); exitFlush(1); return; }
   let allReady = true;
   for (const w of wallets) {
     console.log(`\n  账号 ${w.ADDRESS}`);
@@ -1476,13 +1477,13 @@ async function main() {
     : `自动 ×${CFG.GAS_MULT} (上限 ${CFG.GAS_MAX_GWEI} gwei)`;
   info('SYS', `FTS 引擎 v${VERSION} 启动 | 模式=${MODE} | 房间=${CFG.ROOMS.join(',')} | 抢位=[${CFG.SNIPE_MIN_COUNT},${CFG.SNIPE_MAX_COUNT}) | 延迟=${CFG.SNIPE_DELAY_MS}ms | 手续费=${gasDesc}`);
   const wallets = loadWallets();
-  if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); process.exit(21); }
+  if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); exitFlush(21); return; }
   try { fs.chmodSync(WALLETS_FILE, 0o600); } catch (e) { }
 
   if (SELFTEST) { selftestWallets = wallets; return selftest(); }
 
   try { await mgr.pickBest(); }
-  catch (e) { fatal('SYS', 'RPC 初始化失败: ' + formatError(e)); process.exit(22); }
+  catch (e) { fatal('SYS', 'RPC 初始化失败: ' + formatError(e)); exitFlush(22); return; }
   bindRead(mgr.provider);
   await detectEip1559();
 
@@ -1537,10 +1538,10 @@ async function main() {
     if (crashN >= 20) {
       fatal('SYS', '60 秒内未捕获异常超过 20 次，主动退出让外壳重启');
       try { logStream && logStream.end(); } catch (x) { }
-      process.exit(24);
+      exitFlush(24);
     }
   });
   process.on('unhandledRejection', e => { err('SYS', '未处理Promise拒绝: ' + formatError(e && e.message ? e.message : String(e))); });
 }
 
-main().catch(e => { fatal('SYS', '主流程致命错误: ' + formatError(e)); process.exit(23); });
+main().catch(e => { fatal('SYS', '主流程致命错误: ' + formatError(e)); exitFlush(23); });
