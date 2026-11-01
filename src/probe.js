@@ -12,6 +12,14 @@
  *   node probe.js <合约> <你的钱包地址>     # 额外查该地址余额/授权(只读, 仍不需要私钥)
  */
 
+// console.log 写管道是异步的，直接 process.exit 可能在 flush 前退出、截断最后几行
+// (探测结论/建议的下一步最容易丢)。这里等 stdout 排空再退。
+function exitFlush(code) {
+  process.exitCode = code;
+  try { process.stdout.write('', () => process.exit(code)); }
+  catch (e) { process.exit(code); }
+}
+
 let ethers;
 try { ethers = require('ethers'); }
 catch (e) { console.error('缺少 ethers，请先: npm install ethers@6'); process.exit(20); }
@@ -127,7 +135,7 @@ async function pickRpc() {
       console.log(`  ${G}✅${D} ${r.u} 延迟=${r.lat}ms 高度=${r.bn} chainId=${r.cid}${warn}`);
     } else console.log(`  ${R}❌${D} ${r.u} -> ${r.err}`);
   }
-  if (!anyOk) { console.log(R + '\n结论: 没有任何 RPC 可用。检查网络 / 换节点(FTS_HTTP_POOL) / 确认没被防火墙拦。' + D); process.exit(22); }
+  if (!anyOk) { console.log(R + '\n结论: 没有任何 RPC 可用。检查网络 / 换节点(FTS_HTTP_POOL) / 确认没被防火墙拦。' + D); exitFlush(22); return; }
   const best = rs.filter(r => r.ok).sort((a, b) => a.lat - b.lat)[0];
   const provider = new ethers.JsonRpcProvider(best.u, CHAIN_ID, { staticNetwork: true });
   console.log(`  ${G}主用节点: ${best.u}${D}`);
@@ -140,7 +148,8 @@ async function pickRpc() {
   if (!isContract) {
     console.log(R + '  ❌ 该地址上没有合约代码 —— 不是合约地址，脚本里的合约地址很可能是错的！' + D);
     console.log(Y + '  请到项目官方渠道重新核对地址，并确认链一致(BSC / ETH 地址不通用)。' + D);
-    process.exit(1);
+    exitFlush(1);
+    return;
   }
   console.log(`  ${G}✅ 是合约${D}` + ((code.length - 2) / 2 < 500 ? ` ${Y}(代码很短，很可能是代理合约 Proxy)${D}` : ''));
 
@@ -295,5 +304,5 @@ async function pickRpc() {
   console.log('  4) 再跑: ' + LAUNCH + ' --dry-run   (全流程演练，交易不上链)');
   console.log('  5) 最后: ' + LAUNCH + ' --run       (正式交易)');
   console.log(`\n本次使用节点: ${best.u}`);
-  process.exit(missing.length ? 1 : 0);
-})().catch(e => { console.error(R + '探针自身异常: ' + (e.stack || e.message) + D); process.exit(23); });
+  exitFlush(missing.length ? 1 : 0);
+})().catch(e => { console.error(R + '探针自身异常: ' + (e.stack || e.message) + D); exitFlush(23); });

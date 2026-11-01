@@ -69,12 +69,20 @@ function Set-FileAcl {
     try {
         $acl = Get-Acl -LiteralPath $f
         $acl.SetAccessRuleProtection($true, $false)   # 断开继承并清空继承来的规则
-        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
-        $acl.SetAccessRule($rule)
+        # 只留"当前用户 + SYSTEM + Administrators"这三个。
+        # 不能只留当前用户: 备份(VSS)、杀软、管理员运维都读不到文件，属于安全过头。
+        # 用 SID 而不是名字，避免中文系统 / 非英文 locale 下匹配不到。
+        $ids = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')),
+            (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))
+        )
+        foreach ($id in $ids) {
+            $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', 'Allow')))
+        }
         Set-Acl -LiteralPath $f -AclObject $acl
     } catch {
-        # 非 NTFS / 权限不足时静默跳过，不影响主流程
+        Write-WarnMsg "无法收紧 $Name 的权限(非 NTFS 盘或权限不足)，该文件可能对其他用户可读"
     }
 }
 Set-FileAcl 'wallets.json'
@@ -274,6 +282,8 @@ Write-Ok "Node $nodeVer"
 # ------------------------------------------------------------
 $Script:LastNodeExit = 0
 function Invoke-NodeJs {
+    # StdinText 走管道时会按系统代码页转换(中文 Windows 是 GBK)，
+    # 只用来传纯 ASCII(私钥 hex / 0x 地址)，不要塞中文
     param([string]$Name, [string]$Code, [string]$StdinText = $null)
     $f = Join-Path $Script:TmpJsDir ($Name + '.js')
     [System.IO.File]::WriteAllText($f, $Code, (New-Object System.Text.UTF8Encoding($false)))
@@ -620,7 +630,7 @@ if(d.wallets.some(w=>String(w.ADDRESS).toLowerCase()===addr.toLowerCase())){
 d.wallets.push({PRIVATE_KEY:pk,ADDRESS:addr,REFERRER:ref});
 const tmp="wallets.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(d,null,2),{mode:0o600});
-fs.renameSync(tmp,"wallets.json");
+try { fs.renameSync(tmp,"wallets.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
 '@
     $out = Invoke-NodeJs 'wallet-add' $code ($pk + "`n" + $addr + "`n" + $ref)
     if ($Script:LastNodeExit -ne 0) {
@@ -713,7 +723,7 @@ c.GAS_MULT=Number(e.WIZ_GAS_MULT);
 if(e.WIZ_GAS_MODE==="fixed")c.GAS_GWEI=Number(e.WIZ_GAS_FIXED);else c.GAS_GWEI=null;
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
-fs.renameSync(tmp,"config.json");
+try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
@@ -721,6 +731,9 @@ fs.renameSync(tmp,"config.json");
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
+    # 注意: node 是写 .tmp 再 rename，Windows 上 rename 保留的是 tmp 的 ACL(目录继承)，
+    # 所以每次重写都必须重新收紧一次，否则之前设的 ACL 就白做了
+    Set-FileAcl 'config.json'
 
     # 老版本会在每个账号里存 SNIPE_MIN/MAX/DELAY，会覆盖全局设置 -> 提示统一
     $chk = 'try{const d=JSON.parse(require("fs").readFileSync("wallets.json","utf8"));console.log(d.wallets.filter(w=>w.SNIPE_MIN_COUNT!==undefined||w.SNIPE_MAX_COUNT!==undefined||w.SNIPE_DELAY_MS!==undefined).length)}catch(e){console.log(0)}'
@@ -736,9 +749,10 @@ const d=JSON.parse(fs.readFileSync("wallets.json","utf8"));
 d.wallets.forEach(w=>{delete w.SNIPE_MIN_COUNT;delete w.SNIPE_MAX_COUNT;delete w.SNIPE_DELAY_MS;});
 const tmp="wallets.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(d,null,2),{mode:0o600});
-fs.renameSync(tmp,"wallets.json");
+try { fs.renameSync(tmp,"wallets.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
 '@
             $null = Invoke-NodeJs 'wallet-strip' $strip
+            Set-FileAcl 'wallets.json'   # 同上: rename 会把 ACL 重置成目录继承
             Write-Ok "已统一为全局设置"
         } else {
             Write-Host "    保留账号独立设置(全局值对这些账号不生效)"

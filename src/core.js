@@ -197,8 +197,9 @@ function validateCfg() {
     if (!(CFG.APPROVE_USD >= 0)) {
       p.push(`APPROVE_USD(${CFG.APPROVE_USD}) 不能为负，已改回自动(一轮票价)`);
       CFG.APPROVE_USD = null;
-    } else if (CFG.APPROVE_USD >= 1e21) {
-      // >= 1e21 时 String() 会变成 "1e+21" 这种科学计数法，parseUnits 直接不认
+    } else if (String(CFG.APPROVE_USD).indexOf('e') >= 0 || String(CFG.APPROVE_USD).indexOf('E') >= 0) {
+      // 不能只比 1e21: Number 精度下 1e21 附近 String() 就已经变成 "1e+21" 了，
+      // 直接看字符串里有没有科学计数法的 e 更准
       p.push(`APPROVE_USD(${CFG.APPROVE_USD}) 过大(会被转成科学计数法而无法解析)，已改回自动(一轮票价)`);
       CFG.APPROVE_USD = null;
     }
@@ -276,6 +277,13 @@ function formatError(e) {
   if (e.transaction && e.transaction.to) parts.push('to=' + e.transaction.to);
   if (e.info && e.info.error && e.info.error.message) parts.push('rpc=' + String(e.info.error.message).slice(0, 200));
   return parts.join(' | ');
+}
+// console.log 写管道是异步的，直接 process.exit 可能在 flush 前退出、把最后几行截掉
+// (重定向到文件时尤其明显)。这里等 stdout 排空再退，exitCode 先设好兜底。
+function exitFlush(code) {
+  process.exitCode = code;
+  try { process.stdout.write('', () => process.exit(code)); }
+  catch (e) { process.exit(code); }
 }
 function withTimeout(p, ms, label) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error('超时 ' + ms + 'ms: ' + (label || '')), { code: 'TIMEOUT' })), ms))]);
@@ -1424,7 +1432,7 @@ async function selftest() {
 
   console.log('\n========== 自检结论 ==========');
   console.log(allReady ? C.g + '✅ 具备交易条件，可执行: ' + LAUNCH + ' --run' + C.d : C.y + '⚠️ 存在阻塞项，请根据上方 ❌ 修复后再运行' + C.d);
-  process.exit(allReady ? 0 : 1);
+  exitFlush(allReady ? 0 : 1);
 }
 
 // ---------------- 钱包加载 ----------------

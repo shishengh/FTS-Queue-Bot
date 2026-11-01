@@ -366,7 +366,7 @@ wiz_header() {
 wiz_ask_int() {   # 提示 默认值 最小 最大 -> REPLY
   local p="$1" d="$2" lo="$3" hi="$4" v
   while true; do
-    read -r -p "    $p [$d]: " v
+    read -r -p "    $p [$d]: " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
     v="${v:-$d}"
     if [[ ! "$v" =~ ^[0-9]+$ ]]; then warn_msg "请输入整数"; continue; fi
     if [ "$v" -lt "$lo" ] || [ "$v" -gt "$hi" ]; then warn_msg "取值范围 ${lo} ~ ${hi}"; continue; fi
@@ -377,7 +377,7 @@ wiz_ask_int() {   # 提示 默认值 最小 最大 -> REPLY
 wiz_ask_dec() {   # 提示 默认值 最小 最大 -> REPLY（支持小数）
   local p="$1" d="$2" lo="$3" hi="$4" v
   while true; do
-    read -r -p "    $p [$d]: " v
+    read -r -p "    $p [$d]: " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
     v="${v:-$d}"
     if [[ ! "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then warn_msg "请输入数字"; continue; fi
     if ! awk -v a="$v" -v lo="$lo" -v hi="$hi" 'BEGIN{exit !((a+0)>=(lo+0) && (a+0)<=(hi+0))}'; then
@@ -492,7 +492,9 @@ wiz_add_account() {
     d.wallets.push({ PRIVATE_KEY: pk, ADDRESS: addr, REFERRER: ref });
     const tmp = "wallets.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(d, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, "wallets.json");
+    // rename 失败时别把明文私钥留在 .tmp 里
+    try { fs.renameSync(tmp, "wallets.json"); }
+    finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
   ' || { warn_msg "写入失败(地址重复或文件异常)"; sleep 1; return; }
   chmod 600 wallets.json 2>/dev/null || true
   ok_msg "账号 $addr 已添加"
