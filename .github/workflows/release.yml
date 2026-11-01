@@ -54,7 +54,10 @@ jobs:
           echo "引擎语法 OK"
 
       - name: 回归测试
-        run: node test/sendtx-nonce.js
+        run: |
+          npm install ethers@6 --no-audit --no-fund --no-save
+          node test/sendtx-nonce.js
+          node test/approve-guard.js
 
       - name: 生成校验和
         run: |

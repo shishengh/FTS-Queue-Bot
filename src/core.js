@@ -176,6 +176,24 @@ function validateCfg() {
   }
   if (!['auto', '0', '2'].includes(CFG.TX_TYPE)) { p.push(`TX_TYPE 只能是 auto/0/2，当前 "${CFG.TX_TYPE}"，已改为 auto`); CFG.TX_TYPE = 'auto'; }
   if (CFG.APPROVE_ROUNDS < 1) { p.push('APPROVE_ROUNDS 必须 >=1，已改为 1'); CFG.APPROVE_ROUNDS = 1; }
+  // cfgNum 只校验"是不是有限数字"，1.5 能过关，但后面 BigInt(1.5) 会抛 RangeError，
+  // 结果是这个账号每次要授权时都炸在这里，且日志被节流后基本看不到
+  if (!Number.isInteger(CFG.APPROVE_ROUNDS)) {
+    const fixed = Math.max(1, Math.floor(CFG.APPROVE_ROUNDS));
+    p.push(`APPROVE_ROUNDS(${CFG.APPROVE_ROUNDS}) 必须是整数，已改为 ${fixed}`);
+    CFG.APPROVE_ROUNDS = fixed;
+  }
+  if (CFG.APPROVE_USD !== null) {
+    // 负数: parseUnits 能过，但 approve(uint256) 编码时会炸
+    if (!(CFG.APPROVE_USD >= 0)) {
+      p.push(`APPROVE_USD(${CFG.APPROVE_USD}) 不能为负，已改回自动(一轮票价)`);
+      CFG.APPROVE_USD = null;
+    } else if (CFG.APPROVE_USD >= 1e21) {
+      // >= 1e21 时 String() 会变成 "1e+21" 这种科学计数法，parseUnits 直接不认
+      p.push(`APPROVE_USD(${CFG.APPROVE_USD}) 过大(会被转成科学计数法而无法解析)，已改回自动(一轮票价)`);
+      CFG.APPROVE_USD = null;
+    }
+  }
   if (CFG.GAP_STUCK_MS < 15000) { p.push('GAP_STUCK_MS 太小(容易误判)，已改为 15000'); CFG.GAP_STUCK_MS = 15000; }
   return p.concat(cfgProblems);
 }
@@ -693,13 +711,23 @@ async function ensureFunds(inst, ticketPrice, room) {
 
   // 默认: 授权额度 = 本轮票价。可用 FTS_APPROVE_ROUNDS>1 或 FTS_APPROVE_USD 覆盖
   let target;
-  if (CFG.APPROVE_USD === null) {
-    target = ticketPrice * BigInt(Math.max(1, CFG.APPROVE_ROUNDS));
-  } else if (CFG.APPROVE_USD === 0) {
-    target = bal;
-  } else {
-    target = ethers.parseUnits(String(CFG.APPROVE_USD), 18);
+  try {
+    if (CFG.APPROVE_USD === null) {
+      // Math.floor 是给 validateCfg 漏网时的兜底: BigInt(1.5) 会抛 RangeError
+      target = ticketPrice * BigInt(Math.max(1, Math.floor(CFG.APPROVE_ROUNDS)));
+    } else if (CFG.APPROVE_USD === 0) {
+      target = bal;
+    } else {
+      target = ethers.parseUnits(String(CFG.APPROVE_USD), 18);
+    }
+  } catch (e) {
+    // 配置写坏时绝不能让异常冒到抢单流程外面: 那样这个账号每轮都在这里炸，
+    // 而日志被 errOnce 节流后几乎看不见，表现就是"授权永远失败但不知道为什么"
+    err(inst.address, `[${tag}] 计算授权额度失败，已按一轮票价兜底(检查 APPROVE_USD / APPROVE_ROUNDS): ${formatError(e)}`);
+    target = ticketPrice;
   }
+  // 负数 / 0 一律退回一轮票价: approve 不接受负值，0 授权等于白发一笔交易
+  if (!(target > 0n)) target = ticketPrice;
   if (bal < target) target = bal; // 余额不足则按余额授权
   const rounds = Number(ethers.formatUnits(target, 18)) / Number(ethers.formatUnits(ticketPrice, 18));
   info(inst.address, `[${tag}] 授权不足(当前 ${ethers.formatUnits(allowance, 18)} < 本轮需要 ${ethers.formatUnits(need, 18)})，发起授权 ${ethers.formatUnits(target, 18)} USDT (${rounds >= 1 ? Math.round(rounds) : rounds.toFixed(2)} 轮用量)`);
@@ -710,7 +738,7 @@ async function ensureFunds(inst, ticketPrice, room) {
     args: [CFG.QUEUE_ADDR, target]
   });
   if (!okTx) {
-    err(inst.address, `[${tag}] 授权失败，本轮放弃入场(不会扣款)。常见原因: 钱包 USDT 为 0 / BNB 不够 gas / 合约暂停 / 节点广播失败`);
+    err(inst.address, `[${tag}] 授权失败，本轮放弃入场(不会扣款)。具体原因见上方 sendTx 的日志(余额不足 / gas 不够 / revert / 广播失败)`);
     return false;
   }
   return true;
