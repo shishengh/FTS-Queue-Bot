@@ -238,6 +238,15 @@ python3 build/build.py
 
 `build.py` 只做一件事：把 `src/core.js` / `src/probe.js` 原样注入两个模板。构建时会检查源码里有没有行首的 `'@`（会提前终止 PowerShell here-string）。
 
+跑回归测试（无需额外依赖）：
+
+```bash
+node test/sendtx-nonce.js
+```
+
+这个测试把 `sendTx` 从源码里整段抽出来，用桩函数模拟「第一次广播超时但交易已进 mempool」，
+断言第二次尝试用的是**同一个 nonce + 更高 gas**（替换），而不是重新读 pending 拿 N+1（并排发两笔）。
+
 ## 已验证环境
 
 | 项          | 版本                 |

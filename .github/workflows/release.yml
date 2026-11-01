@@ -53,6 +53,9 @@ jobs:
           node --check src/probe.js
           echo "引擎语法 OK"
 
+      - name: 回归测试
+        run: node test/sendtx-nonce.js
+
       - name: 生成校验和
         run: |
           cd dist

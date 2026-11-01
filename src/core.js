@@ -888,6 +888,11 @@ function startGapFixer(inst) {
 async function sendTx(inst, opt) {
   const release = await inst.mutex.acquire();
   try {
+    // 跨 attempt 保留的 nonce: 第一次读出来就锁定。
+    // 不锁的话: attempt 1 广播超时(交易其实可能已进 mempool)后 inst.nonce 仍是 null，
+    // attempt 2 会重新读 pending 拿到 N+1，结果是"并排发两笔"而不是
+    // buildFeeParams(2) 想要的"同 nonce 加价替换"，白烧一笔 gas。
+    let attemptNonce = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         // ---- 手续费策略: 运行时探测链是否支持 EIP-1559，不硬编码交易类型 ----
@@ -909,9 +914,12 @@ async function sendTx(inst, opt) {
           return false;
         }
 
-        const nonce = inst.nonce !== null
-          ? inst.nonce
-          : await mgr.rpc(p => p.getTransactionCount(inst.address, 'pending'));
+        const nonce = attemptNonce !== null
+          ? attemptNonce
+          : (inst.nonce !== null
+              ? inst.nonce
+              : await mgr.rpc(p => p.getTransactionCount(inst.address, 'pending')));
+        attemptNonce = nonce;   // 锁定，attempt 2 不再重读 pending
 
         if (DRY_RUN) {
           info(inst.address, `[DRY-RUN] 将发送 ${opt.label}: to=${opt.contract.target} fn=${opt.method}(${opt.args.map(String).join(',')}) nonce=${nonce} gas=${gasLimit} gasPrice=${ethers.formatUnits(gasPrice, 'gwei')}gwei`);
@@ -939,6 +947,10 @@ async function sendTx(inst, opt) {
         try {
           receipt = await withTimeout(tx.wait(1, CFG.TX_WAIT_MS), CFG.TX_WAIT_MS + 10000, 'wait');
         } catch (e) {
+          // 这里和 confirmTxInBackground 的 wait 超时策略不同: 那边是"同 nonce 加价重播"，
+          // 这边直接放弃、下一轮重读 pending。原因是 sendTx 全程持有 inst.mutex，
+          // 而 rebroadcastSameNonce 也要拿同一把锁(不可重入)，在这里调用会死锁。
+          // 当前行为能闭环(gapFixer 兜底)，代价是最多多烧一笔 gas。
           warn(inst.address, `${opt.label} 等待确认超时: ${tx.hash} -> 需手动确认，暂时锁定 nonce`);
           inst.nonce = null;
           return false;
@@ -956,11 +968,13 @@ async function sendTx(inst, opt) {
         const c = e.code || '';
         if (c === 'NONCE_EXPIRED' || /nonce/i.test(e.shortMessage || e.message || '')) {
           warn(inst.address, `${opt.label} nonce 冲突，刷新后重试: ${formatError(e)}`);
+          attemptNonce = null;   // 唯一应该重读 nonce 的场景
           inst.nonce = null;
           await sleep(500);
           continue;
         }
         if (c === 'REPLACEMENT_UNDERPRICED') {
+          // attemptNonce 保留: 正是要用同一 nonce 加价替换
           warn(inst.address, `${opt.label} gas 过低(replacement underpriced)，加价重试`);
           await sleep(500);
           continue;
@@ -976,6 +990,8 @@ async function sendTx(inst, opt) {
           return false;
         }
         if (['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT'].includes(c)) {
+          // attemptNonce 保留: 第一次很可能已经广播进 mempool 了，
+          // attempt 2 应该用同一 nonce 加价替换，而不是再发一笔 N+1
           warn(inst.address, `${opt.label} 网络异常(${c})，切换节点重试(${attempt}/2): ${formatError(e)}`);
           await mgr.rotate();
           await sleep(800);
