@@ -454,19 +454,21 @@ wiz_add_account() {
   wiz_header
   echo "    ---- 添加账号 ----"
   [ -f wallets.json ] || echo '{"wallets": []}' > wallets.json
+  # read 在 stdin 到 EOF 时返回非 0 且变量为空，不处理会变成死循环刷错误
   while true; do
-    read -r -s -p "    私钥 (64位hex，可不带0x，输入不显示): " pk; echo
+    read -r -s -p "    私钥 (64位hex，可不带0x，输入不显示): " pk || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    echo
     pk="${pk#0x}"
     if [[ "$pk" =~ ^[0-9a-fA-F]{64}$ ]]; then break; fi
     warn_msg "私钥格式错误(必须是 64 位十六进制)"
   done
   while true; do
-    read -r -p "    钱包地址 (0x开头): " addr
+    read -r -p "    钱包地址 (0x开头): " addr || { echo; die "输入已结束(EOF)，配置向导退出"; }
     if [[ "$addr" =~ ^0x[a-fA-F0-9]{40}$ ]]; then break; fi
     warn_msg "地址格式错误"
   done
   while true; do
-    read -r -p "    推荐人地址 (0x开头): " ref
+    read -r -p "    推荐人地址 (0x开头): " ref || { echo; die "输入已结束(EOF)，配置向导退出"; }
     if [[ "$ref" =~ ^0x[a-fA-F0-9]{40}$ ]]; then break; fi
     warn_msg "推荐人地址格式错误"
   done

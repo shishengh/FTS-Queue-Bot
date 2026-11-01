@@ -317,6 +317,7 @@ $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Scrip
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
 $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
+$Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
 # 手改 config.json 写成 "abc" 时，后面的 [int] 转换会抛异常把整个向导搞崩。
 # 统一在这里挡一道: 不是合法数字就保留默认值。
@@ -351,7 +352,12 @@ put("GAS_MULT",c.GAS_MULT);
                 'SNIPE_DELAY_MS'    { if (Test-IsNum $v) { $Script:WizDelay = $v } }
                 'CLAIM_INTERVAL_MS' {
                     # config.json 被手改成非法值时不能把整个向导搞崩
-                    try { $Script:WizClaim = [string][int]([double]$v / 1000) } catch { }
+                    try {
+                        $Script:WizClaim = [string][int]([double]$v / 1000)
+                        # 500ms 会被截成 0；存回去就是 0 -> claimLoop 几乎不停顿，
+                        # 退款扫描会把节点打到 429，反而漏领
+                        if ([int]$Script:WizClaim -lt 10) { $Script:WizClaim = '10' }
+                    } catch { }
                 }
                 'MIN_BNB_GAS'       { if (Test-IsNum $v) { $Script:WizBnb = $v } }
                 'GAS_MODE'          { if ($v -eq 'auto') { $Script:WizGasMode = 'auto' } else { $Script:WizGasMode = 'fixed' } }
@@ -385,11 +391,16 @@ function Get-GasText {
 }
 
 function Get-AccountCount {
-    if ($Script:WizAccountCount -ge 0) { return $Script:WizAccountCount }
-    if (-not (Test-Path -LiteralPath 'wallets.json')) { $Script:WizAccountCount = 0; return 0 }
+    $wf = Join-Path $Script:WorkDir 'wallets.json'
+    $stamp = [datetime]::MinValue
+    if (Test-Path -LiteralPath $wf) { $stamp = (Get-Item -LiteralPath $wf).LastWriteTimeUtc }
+    # 缓存有效 = 有值 且 文件没被外部改过
+    if ($Script:WizAccountCount -ge 0 -and $Script:WizAccountStamp -eq $stamp) { return $Script:WizAccountCount }
+    if (-not (Test-Path -LiteralPath $wf)) { $Script:WizAccountCount = 0; $Script:WizAccountStamp = $stamp; return 0 }
     $code = 'try{const d=JSON.parse(require("fs").readFileSync("wallets.json","utf8"));console.log((d.wallets||[]).length)}catch(e){console.log(0)}'
     $n = Invoke-NodeJs 'acc-count' $code
     if ("$n" -match '^\d+$') { $Script:WizAccountCount = [int]$n } else { $Script:WizAccountCount = 0 }
+    $Script:WizAccountStamp = $stamp
     return $Script:WizAccountCount
 }
 
@@ -508,6 +519,8 @@ function Add-Account {
     # 注意: Read-Host -AsSecureString 在 stdin 被重定向时(管道/文件)会永久挂起，
     # 既不报错也不返回。所以重定向时退回普通 Read-Host —— 反正没有回显。
     $pipeMode = [Console]::IsInputRedirected
+    # stdin 到 EOF 时 Read-Host 一直返回空串，不设上限就是死循环刷错误
+    $eof = 0
     while ($true) {
         if ($pipeMode) {
             $pk = "$(Read-Host '    私钥 (64位hex，可不带0x)')".Trim()
@@ -519,6 +532,10 @@ function Add-Account {
             try { $pk = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
             $pk = "$pk".Trim()
         }
+        if ([string]::IsNullOrWhiteSpace($pk)) {
+            $eof++
+            if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
+        } else { $eof = 0 }
         if ($pk -match '^0x') { $pk = $pk.Substring(2) }
         if ($pk -match '^[0-9a-fA-F]{64}$') { break }
         Write-WarnMsg "私钥格式错误(必须是 64 位十六进制)"
@@ -526,12 +543,20 @@ function Add-Account {
     $addr = ''
     while ($true) {
         $addr = "$(Read-Host '    钱包地址 (0x开头)')".Trim()
+        if ([string]::IsNullOrWhiteSpace($addr)) {
+            $eof++
+            if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
+        } else { $eof = 0 }
         if ($addr -match '^0x[a-fA-F0-9]{40}$') { break }
         Write-WarnMsg "地址格式错误"
     }
     $ref = ''
     while ($true) {
         $ref = "$(Read-Host '    推荐人地址 (0x开头)')".Trim()
+        if ([string]::IsNullOrWhiteSpace($ref)) {
+            $eof++
+            if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
+        } else { $eof = 0 }
         if ($ref -match '^0x[a-fA-F0-9]{40}$') { break }
         Write-WarnMsg "推荐人地址格式错误"
     }

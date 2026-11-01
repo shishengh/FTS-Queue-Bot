@@ -168,6 +168,12 @@ function validateCfg() {
     p.push(`固定 gas(${CFG.GAS_FIXED_GWEI} gwei) 低于下限(${CFG.GAS_MIN_GWEI} gwei)，已把下限降到 ${CFG.GAS_FIXED_GWEI}`);
     CFG.GAS_MIN_GWEI = CFG.GAS_FIXED_GWEI;
   }
+  // 领返利间隔太短 = 不停地打节点，很快就会吃 429，反而漏领。
+  // 0 / 几百毫秒这种值多半是手改配置时算错了单位(把秒当毫秒写)。
+  if (CFG.CLAIM_INTERVAL_MS < 5000) {
+    p.push(`CLAIM_INTERVAL_MS(${CFG.CLAIM_INTERVAL_MS}ms) 过小，已按 5000ms 处理(否则会疯狂请求节点触发限流)`);
+    CFG.CLAIM_INTERVAL_MS = 5000;
+  }
   if (!['auto', '0', '2'].includes(CFG.TX_TYPE)) { p.push(`TX_TYPE 只能是 auto/0/2，当前 "${CFG.TX_TYPE}"，已改为 auto`); CFG.TX_TYPE = 'auto'; }
   if (CFG.APPROVE_ROUNDS < 1) { p.push('APPROVE_ROUNDS 必须 >=1，已改为 1'); CFG.APPROVE_ROUNDS = 1; }
   if (CFG.GAP_STUCK_MS < 15000) { p.push('GAP_STUCK_MS 太小(容易误判)，已改为 15000'); CFG.GAP_STUCK_MS = 15000; }
