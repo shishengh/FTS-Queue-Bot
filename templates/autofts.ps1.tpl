@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-    FTS 多账号自动打金脚本 - Windows 版
+    FTS 多账号自动打金脚本 - Windows 版 v@@VERSION@@
     同一个文件同时兼容 PowerShell 5.1 (Desktop) 与 PowerShell 7 (Core)
 
     用法:
@@ -60,6 +60,31 @@ function Repair-JsonBom {
 Repair-JsonBom 'config.json'
 Repair-JsonBom 'wallets.json'
 
+# Windows 上 chmod 只影响"只读"位，不等于权限保护。
+# wallets.json 里就是明文私钥，必须用 ACL 锁到只有当前用户能读。
+function Set-FileAcl {
+    param([string]$Name)
+    $f = Join-Path $Script:WorkDir $Name
+    if (-not (Test-Path -LiteralPath $f)) { return }
+    try {
+        $acl = Get-Acl -LiteralPath $f
+        $acl.SetAccessRuleProtection($true, $false)   # 断开继承并清空继承来的规则
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
+        $acl.SetAccessRule($rule)
+        Set-Acl -LiteralPath $f -AclObject $acl
+    } catch {
+        # 非 NTFS / 权限不足时静默跳过，不影响主流程
+    }
+}
+Set-FileAcl 'wallets.json'
+Set-FileAcl 'config.json'
+
+# 清掉上次遗留的临时 .js（正常只有十来个，别让它无限增长）
+Get-ChildItem -Path $Script:TmpJsDir -Filter '*.js' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
 # ============================================================
 # 输出
 # ============================================================
@@ -68,6 +93,17 @@ function Write-WarnMsg { param([string]$m) Write-Host "[!]     $m" -ForegroundCo
 function Write-ErrMsg  { param([string]$m) Write-Host "[X]     $m" -ForegroundColor Red }
 function Write-Die     { param([string]$m) Write-Host "[FATAL] $m" -ForegroundColor Red; exit 1 }
 function Write-Step    { param([string]$m) Write-Host $m -ForegroundColor Cyan }
+
+# 菜单读取: 管道/文件输入到 EOF 时 Read-Host 会一直返回空串，
+# 不拦住就是无限刷屏。交互式终端里按回车是合法操作，不能误判。
+function Read-Menu {
+    param([string]$Prompt)
+    $v = Read-Host $Prompt
+    if ([Console]::IsInputRedirected -and [string]::IsNullOrEmpty($v)) {
+        Write-Die "输入已结束(EOF)，配置向导退出"
+    }
+    return $v
+}
 
 # ============================================================
 # 帮助
@@ -214,6 +250,13 @@ if (-not $nodeCmd) {
     Write-WarnMsg "未找到 Node.js，尝试用 winget 安装..."
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) { & $winget.Source install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements 2>&1 | Out-Host }
+    # winget 只改注册表里的 PATH，当前进程的环境变量不会自动刷新，
+    # 不重新读一遍的话下面 Get-Command node 大概率还是找不到
+    try {
+        $m = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+        $u = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        $env:PATH = (@($m, $u) | Where-Object { $_ }) -join ';'
+    } catch { }
     $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
     if (-not $nodeCmd) { Write-Die "未找到 Node.js。请安装 Node 18+ : https://nodejs.org/ 或 winget install OpenJS.NodeJS.LTS" }
 }
@@ -231,10 +274,14 @@ Write-Ok "Node $nodeVer"
 # ------------------------------------------------------------
 $Script:LastNodeExit = 0
 function Invoke-NodeJs {
-    param([string]$Name, [string]$Code)
+    param([string]$Name, [string]$Code, [string]$StdinText = $null)
     $f = Join-Path $Script:TmpJsDir ($Name + '.js')
     [System.IO.File]::WriteAllText($f, $Code, (New-Object System.Text.UTF8Encoding($false)))
-    $out = & $Script:NodeExe $f 2>&1
+    if ($null -ne $StdinText) {
+        $out = $StdinText | & $Script:NodeExe $f 2>&1
+    } else {
+        $out = & $Script:NodeExe $f 2>&1
+    }
     $Script:LastNodeExit = $LASTEXITCODE
     return $out
 }
@@ -561,28 +608,28 @@ function Add-Account {
         Write-WarnMsg "推荐人地址格式错误"
     }
 
-    $env:FTS_PK = $pk; $env:FTS_ADDR = $addr; $env:FTS_REF = $ref
+    # 私钥不放进环境变量(同用户可用 Process Explorer / WMI 读到)，改从 stdin 传
     $code = @'
 const fs=require("fs");
+const lines=fs.readFileSync(0,"utf8").split("\n");
+const pk=(lines[0]||"").trim(), addr=(lines[1]||"").trim(), ref=(lines[2]||"").trim();
 const d=JSON.parse(fs.readFileSync("wallets.json","utf8"));
-if(d.wallets.some(w=>String(w.ADDRESS).toLowerCase()===process.env.FTS_ADDR.toLowerCase())){
+if(d.wallets.some(w=>String(w.ADDRESS).toLowerCase()===addr.toLowerCase())){
   console.error("该地址已在列表中"); process.exit(2);
 }
-d.wallets.push({PRIVATE_KEY:process.env.FTS_PK,ADDRESS:process.env.FTS_ADDR,REFERRER:process.env.FTS_REF});
+d.wallets.push({PRIVATE_KEY:pk,ADDRESS:addr,REFERRER:ref});
 const tmp="wallets.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(d,null,2),{mode:0o600});
 fs.renameSync(tmp,"wallets.json");
 '@
-    $out = Invoke-NodeJs 'wallet-add' $code
-    Remove-Item Env:FTS_PK -ErrorAction SilentlyContinue
-    Remove-Item Env:FTS_ADDR -ErrorAction SilentlyContinue
-    Remove-Item Env:FTS_REF -ErrorAction SilentlyContinue
+    $out = Invoke-NodeJs 'wallet-add' $code ($pk + "`n" + $addr + "`n" + $ref)
     if ($Script:LastNodeExit -ne 0) {
         foreach ($l in $out) { Write-WarnMsg "$l" }
         Start-Sleep -Seconds 1
         return
     }
     $Script:WizAccountCount = -1    # 账号变了，缓存失效
+    Set-FileAcl 'wallets.json'      # 重写过的文件 ACL 会重置，重新收紧
     Write-Ok "账号 $addr 已添加"
     Start-Sleep -Seconds 1
 }
@@ -592,6 +639,7 @@ function Clear-Accounts {
     if ($a -match '^[Yy]') {
         Set-Content -LiteralPath 'wallets.json' -Value '{"wallets": []}' -Encoding ASCII
         $Script:WizAccountCount = -1    # 账号变了，缓存失效
+        Set-FileAcl 'wallets.json'
         Write-Ok "已清空"
     } else {
         Write-Host "    已取消"
@@ -612,7 +660,7 @@ function Show-Accounts {
         }
         Write-Host "    ------------------------------------------------"
         Write-Host "      [1] 添加账号    [2] 清空重录    [0] 返回"
-        $ch = Read-Host "    请选择"
+        $ch = Read-Menu "    请选择"
         switch ($ch) {
             '1' { Add-Account }
             '2' { Clear-Accounts }
@@ -709,7 +757,7 @@ function Invoke-Wizard {
         Write-Host "      [7] 账号管理          [8] 恢复默认值"
         Write-Host "      [9] 保存并退出        [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
-        $ch = Read-Host "    请选择"
+        $ch = Read-Menu "    请选择"
         switch ($ch) {
             '1' { Edit-Rooms }
             '2' { Edit-Range }

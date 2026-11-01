@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================
-# FTS 多账号自动打金脚本 - 加固版 v2.4 (Termux / Linux 通用)
+# FTS 多账号自动打金脚本 v@@VERSION@@ - 加固版 (Termux / Linux 通用)
 # ==============================================================
 set -uo pipefail
 
@@ -98,7 +98,12 @@ stop_engine() {
     [ -n "$q" ] || return 1
     kill -0 "$q" 2>/dev/null || return 1
     cmd="$(ps -p "$q" -o args= 2>/dev/null || echo '')"
-    [ -z "$cmd" ] && return 0          # ps 不支持 -o 时(部分 Termux)退化为只校验存活
+    if [ -z "$cmd" ]; then
+      # 读不到命令行(ps 不支持 -o / 权限不足)时不要贸然认领这个 PID:
+      # PID 被复用时 kill 会误伤无关进程，比"少停一次"严重得多
+      warn_msg "无法校验 PID $q 的命令行，跳过(如仍占用请手动结束)"
+      return 1
+    fi
     case "$cmd" in *autofts.sh*|*core.js*|*probe.js*) return 0 ;; esac
     return 1
   }
@@ -248,7 +253,7 @@ if [ "$MODE" = "probe" ]; then
   echo ""
   # 防止把 --help 之类的开关当成合约地址传下去
   case "$PROBE_ARGS" in
-    *--*|*-h*) warn_msg "probe 只接受 <合约地址> [钱包地址]，不要带 -- 参数"; PROBE_ARGS="" ;;
+    -*) warn_msg "probe 只接受 <合约地址> [钱包地址]，不要带 -- 参数"; PROBE_ARGS="" ;;
   esac
   # shellcheck disable=SC2086
   node probe.js $PROBE_ARGS
@@ -422,7 +427,7 @@ wiz_edit_gas() {
   echo "      [1] 固定 gas 价(默认 0.05 gwei，每笔都按这个价发)"
   echo "      [2] 自动: 按链上实时价上浮，并设上限保护"
   echo "    当前: $(wiz_gas_text)"
-  read -r -p "    请选择 [1/2]: " ch
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
   case "$ch" in
     2) wiz_ask_dec "上浮倍数(相对链上实时价)" "$WIZ_GAS_MULT" 1 5
        WIZ_GAS_MULT="$REPLY"
@@ -472,14 +477,19 @@ wiz_add_account() {
     if [[ "$ref" =~ ^0x[a-fA-F0-9]{40}$ ]]; then break; fi
     warn_msg "推荐人地址格式错误"
   done
-  # 不再写入每个账号独立的抢位设置，统一由引导页的全局配置控制
-  FTS_PK="$pk" FTS_ADDR="$addr" FTS_REF="$ref" node -e '
+  # 不再写入每个账号独立的抢位设置，统一由引导页的全局配置控制。
+  # 私钥不放进环境变量(同用户可通过 /proc/<pid>/environ 读到)，改从 stdin 传
+  printf '%s\n%s\n%s\n' "$pk" "$addr" "$ref" | node -e '
     const fs = require("fs");
+    const lines = fs.readFileSync(0, "utf8").split("\n");
+    const pk = (lines[0] || "").trim();
+    const addr = (lines[1] || "").trim();
+    const ref = (lines[2] || "").trim();
     const d = JSON.parse(fs.readFileSync("wallets.json", "utf8"));
-    if (d.wallets.some(w => String(w.ADDRESS).toLowerCase() === process.env.FTS_ADDR.toLowerCase())) {
+    if (d.wallets.some(w => String(w.ADDRESS).toLowerCase() === addr.toLowerCase())) {
       console.error("该地址已在列表中"); process.exit(2);
     }
-    d.wallets.push({ PRIVATE_KEY: process.env.FTS_PK, ADDRESS: process.env.FTS_ADDR, REFERRER: process.env.FTS_REF });
+    d.wallets.push({ PRIVATE_KEY: pk, ADDRESS: addr, REFERRER: ref });
     const tmp = "wallets.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(d, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, "wallets.json");
@@ -514,7 +524,7 @@ wiz_accounts() {
     ' 2>/dev/null
     echo "    ────────────────────────────────────────────────"
     echo "      [1] 添加账号    [2] 清空重录    [0] 返回"
-    read -r -p "    请选择: " ch
+    read -r -p "    请选择: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
     case "$ch" in
       1) wiz_add_account ;;
       2) wiz_clear_accounts ;;
@@ -541,7 +551,8 @@ wiz_defaults() {
 wiz_commit() {
   local ov a
   if [ -z "$WIZ_ROOMS" ]; then warn_msg "至少要选一个房间"; sleep 1; return 1; fi
-  if [ "$WIZ_MIN" -ge "$WIZ_MAX" ]; then warn_msg "抢位下限必须小于上限"; sleep 1; return 1; fi
+  # 配置里手写成 30.5 时 [ -ge ] 会报 integer expression expected，先截断成整数
+  if [ "${WIZ_MIN%%.*}" -ge "${WIZ_MAX%%.*}" ]; then warn_msg "抢位下限必须小于上限"; sleep 1; return 1; fi
 
   WIZ_ROOMS="$WIZ_ROOMS" WIZ_MIN="$WIZ_MIN" WIZ_MAX="$WIZ_MAX" WIZ_DELAY="$WIZ_DELAY" \
   WIZ_GAS_MODE="$WIZ_GAS_MODE" WIZ_GAS_FIXED="$WIZ_GAS_FIXED" WIZ_GAS_MAX="$WIZ_GAS_MAX" \
@@ -607,7 +618,7 @@ wizard_main() {
   while true; do
     wiz_header
     wiz_menu
-    read -r -p "    请选择: " ch
+    read -r -p "    请选择: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
     case "$ch" in
       1) wiz_edit_rooms ;;
       2) wiz_edit_range ;;

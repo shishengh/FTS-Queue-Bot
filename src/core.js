@@ -120,7 +120,13 @@ const CFG = {
     if (raw === null) return null;                                   // 显式 null -> 自动
     if (raw === undefined || raw === '') return 0.05;                // 未配置 -> 默认固定 0.05
     const n = Number(raw);
-    return Number.isFinite(n) && n > 0 ? n : 0.05;
+    if (!Number.isFinite(n)) return 0.05;
+    if (n <= 0) {
+      // 0 gas 在 BSC 上根本不会被打包，别让用户以为设置生效了
+      cfgProblems.push(`GAS_GWEI(${raw}) 必须大于 0，已按默认 0.05 gwei 处理`);
+      return 0.05;
+    }
+    return n;
   })(),
   GAS_LIMIT_CAP: cfgNum(process.env.FTS_GAS_CAP, 800000, 'GAS_LIMIT_CAP'),
   // 交易类型: auto=运行时探测链是否支持 EIP-1559 / 0=强制 Legacy / 2=强制 1559
@@ -154,6 +160,9 @@ function validateCfg() {
     CFG.SNIPE_MAX_COUNT = CFG.SNIPE_MIN_COUNT + 1;
   }
   if (CFG.SNIPE_MIN_COUNT < 0) { p.push('抢单人数下限为负数，已改为 0'); CFG.SNIPE_MIN_COUNT = 0; }
+  // 人数是整数，30.5 这种值没有意义(还会让向导显示"30.5 ~ 60.5 人")
+  if (!Number.isInteger(CFG.SNIPE_MIN_COUNT)) { p.push(`抢单人数下限(${CFG.SNIPE_MIN_COUNT}) 必须是整数，已取整为 ${Math.floor(CFG.SNIPE_MIN_COUNT)}`); CFG.SNIPE_MIN_COUNT = Math.floor(CFG.SNIPE_MIN_COUNT); }
+  if (!Number.isInteger(CFG.SNIPE_MAX_COUNT)) { p.push(`抢单人数上限(${CFG.SNIPE_MAX_COUNT}) 必须是整数，已取整为 ${Math.ceil(CFG.SNIPE_MAX_COUNT)}`); CFG.SNIPE_MAX_COUNT = Math.ceil(CFG.SNIPE_MAX_COUNT); }
   if (!CFG.ROOMS.length) { p.push('ROOMS 为空，已恢复为 [0,1,2]'); CFG.ROOMS = [0, 1, 2]; }
   if (!CFG.HTTP_POOL.length) { p.push('HTTP_POOL 为空，已恢复为默认 BSC 节点'); CFG.HTTP_POOL = ['https://bsc-dataseed1.binance.org', 'https://bsc-rpc.publicnode.com']; }
   if (CFG.CLAIM_LOOKBACK < 1) { p.push('CLAIM_LOOKBACK 必须 >=1，已改为 1'); CFG.CLAIM_LOOKBACK = 1; }
@@ -937,7 +946,14 @@ async function sendTx(inst, opt) {
           gasLimit = (est * 125n) / 100n;
           if (gasLimit > BigInt(CFG.GAS_LIMIT_CAP)) gasLimit = BigInt(CFG.GAS_LIMIT_CAP);
         } catch (e) {
-          // 抢单高峰 revert 很常见(人数已满/已入场)，必须节流，否则每块刷屏
+          // 业务 revert(人数已满/已入场/不在轮次) 很常见，直接放弃这一轮；
+          // 但节点抖动导致的 estimateGas 失败不该白白浪费抢单窗口，重试一次
+          const c = e.code || '';
+          if (attempt === 1 && ['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT'].includes(c)) {
+            warnOnce(inst.address, `${opt.label} 预检遇到网络问题，换节点重试一次: ${formatError(e).slice(0, 120)}`, 30000);
+            await mgr.rotate();
+            continue;
+          }
           errOnce(inst.address, `${opt.label} 预检失败(不会上链): ${formatError(e)}`, 15000);
           return false;
         }
@@ -1340,7 +1356,14 @@ async function selftest() {
     const usdt = await mgr.rpc(p => uRead.balanceOf(w.ADDRESS));
     const allow = await mgr.rpc(p => uRead.allowance(w.ADDRESS, CFG.QUEUE_ADDR));
     console.log(`   BNB=${ethers.formatEther(bnb)} | USDT=${ethers.formatUnits(usdt, 18)} | 已授权=${ethers.formatUnits(allow, 18)} (单轮授权模式)`);
-    if (bnb < ethers.parseEther('0.005')) { console.log('   ❌ BNB 不足，无法支付 gas，所有交易都会失败'); allReady = false; }
+    // 阈值必须跟 CFG.MIN_BNB_GAS 一致，否则会出现"selftest 说够、跑起来说偏低"的分裂
+    const minBnb = ethers.parseEther(String(CFG.MIN_BNB_GAS));
+    if (bnb < minBnb) {
+      console.log(`   ❌ BNB 不足(当前 ${ethers.formatEther(bnb)} < 阈值 ${CFG.MIN_BNB_GAS})，无法支付 gas，所有交易都会失败`);
+      allReady = false;
+    } else if (bnb < minBnb * 3n) {
+      console.log(`   ⚠️ BNB 偏低(当前 ${ethers.formatEther(bnb)}，阈值 ${CFG.MIN_BNB_GAS})，建议多留一点，否则拥堵时可能不够 gas`);
+    }
     // 逐房间说明钱够不够
     for (const room of CFG.ROOMS) {
       if (!roomOk[room]) continue;

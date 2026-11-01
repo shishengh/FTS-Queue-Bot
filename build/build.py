@@ -43,6 +43,9 @@ def check_ps_safe(name, body):
 
 
 def main():
+    version = read_text(os.path.join(ROOT, "VERSION")).strip()
+    if not version:
+        sys.exit("错误: VERSION 文件为空")
     core = read_text(os.path.join(SRC_DIR, "core.js"))
     probe = read_text(os.path.join(SRC_DIR, "probe.js"))
     check_ps_safe("src/core.js", core)
@@ -57,7 +60,7 @@ def main():
     sh = read_text(os.path.join(TPL_DIR, "autofts.sh.tpl"))
     if CORE_MARK not in sh or PROBE_MARK not in sh:
         sys.exit("错误: autofts.sh.tpl 里缺少占位符")
-    sh = sh.replace(CORE_MARK, core_inject).replace(PROBE_MARK, probe_inject)
+    sh = sh.replace(CORE_MARK, core_inject).replace(PROBE_MARK, probe_inject).replace("@@VERSION@@", version)
     sh_path = os.path.join(DIST_DIR, "autofts.sh")
     with open(sh_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(sh)
@@ -70,12 +73,17 @@ def main():
     ps = read_text(os.path.join(TPL_DIR, "autofts.ps1.tpl"))
     if CORE_MARK not in ps or PROBE_MARK not in ps:
         sys.exit("错误: autofts.ps1.tpl 里缺少占位符")
-    ps = ps.replace(CORE_MARK, core_inject).replace(PROBE_MARK, probe_inject)
+    ps = ps.replace(CORE_MARK, core_inject).replace(PROBE_MARK, probe_inject).replace("@@VERSION@@", version)
     ps = ps.replace("\r\n", "\n").replace("\n", "\r\n")
     ps_path = os.path.join(DIST_DIR, "autofts.ps1")
     # utf-8-sig = 写 BOM；newline="" 防止 Python 再动一次换行
     with open(ps_path, "w", encoding="utf-8-sig", newline="") as f:
         f.write(ps)
+
+    for path in (sh_path, ps_path):
+        with open(path, encoding="utf-8-sig") as f:
+            if "@@" in f.read():
+                sys.exit("错误: %s 里还有没替换的占位符" % os.path.basename(path))
 
     for p in (sh_path, ps_path):
         size = os.path.getsize(p)
