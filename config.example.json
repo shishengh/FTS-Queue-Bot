@@ -10,6 +10,7 @@
   "MIN_BNB_GAS": 0.005,
   "CLAIM_WIN": true,
   "MINER_ENABLED": false,
+  "MINER_MODE": "old",
   "MINER_USD": 100,
   "MINER_ROOM": 0
 }

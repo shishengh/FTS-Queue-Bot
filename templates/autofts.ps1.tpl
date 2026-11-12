@@ -385,7 +385,7 @@ if ($Mode -eq 'probe') {
 $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
 $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
-$Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizClaimWin = '1'
+$Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
@@ -413,6 +413,7 @@ put("GAS_MULT",c.GAS_MULT);
 console.log("MINER_ENABLED="+(c.MINER_ENABLED===true||c.MINER_ENABLED==="true"||c.MINER_ENABLED===1?"1":"0"));
 put("MINER_USD",c.MINER_USD);
 console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
+put("MINER_MODE",c.MINER_MODE);
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -440,6 +441,7 @@ console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0
                 'MINER_ENABLED'     { if ($v -eq '1') { $Script:WizMiner = '1' } else { $Script:WizMiner = '0' } }
                 'MINER_USD'         { if (Test-IsNum $v) { $Script:WizMinerUsd = $v } }
                 'CLAIM_WIN'         { if ($v -eq '1') { $Script:WizClaimWin = '1' } else { $Script:WizClaimWin = '0' } }
+                'MINER_MODE'        { if ($v -in @('old','new','both')) { $Script:WizMinerMode = $v } }
             }
         }
     }
@@ -467,8 +469,12 @@ function Get-GasText {
 }
 
 function Get-MinerText {
-    if ($Script:WizMiner -eq '1') { return "开(老额度达标后组机，固定付 $($Script:WizMinerUsd) USDT)" }
-    return '关'
+    if ($Script:WizMiner -ne '1') { return '关' }
+    switch ($Script:WizMinerMode) {
+        'new'  { return '开(新版: 按矿机额度实额支付)' }
+        'both' { return "开(新版按额度 + 老系统固定 $($Script:WizMinerUsd) USDT)" }
+        default { return "开(老系统: 固定付 $($Script:WizMinerUsd) USDT)" }
+    }
 }
 
 function Get-ClaimWinText {
@@ -615,7 +621,16 @@ function Edit-Miner {
     $ch = Read-Menu "    请选择 [1/2]"
     if ($ch -eq '1') {
         $Script:WizMiner = '1'
-        $Script:WizMinerUsd = Ask-Dec "组机固定支付(USDT)" $Script:WizMinerUsd 1 10000
+        Write-Host ""
+        Write-Host "    组机模式: 老额度按固定 100U 支付；新版额度按额度实额支付"
+        Write-Host "      [1] 只用老额度(固定金额)   [2] 只用新版额度   [3] 两者都组"
+        $md = Read-Menu "    请选择 [1/2/3]"
+        if ($md -eq '2') { $Script:WizMinerMode = 'new' }
+        elseif ($md -eq '3') { $Script:WizMinerMode = 'both' }
+        else { $Script:WizMinerMode = 'old' }
+        if ($Script:WizMinerMode -ne 'new') {
+            $Script:WizMinerUsd = Ask-Dec "老系统组机固定支付(USDT)" $Script:WizMinerUsd 1 10000
+        }
     } else {
         $Script:WizMiner = '0'
     }
@@ -739,7 +754,7 @@ function Reset-Defaults {
         $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
         $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
         $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
-        $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizClaimWin = '1'
+        $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
         Write-Ok "已恢复默认(尚未保存)"
     } else {
         Write-Host "    已取消"
@@ -764,6 +779,7 @@ function Save-Wiz {
     $env:WIZ_MINER = $Script:WizMiner
     $env:WIZ_MINER_USD = $Script:WizMinerUsd
     $env:WIZ_CLAIM_WIN = $Script:WizClaimWin
+    $env:WIZ_MINER_MODE = $Script:WizMinerMode
 
     $code = @'
 const fs=require("fs");
@@ -781,6 +797,7 @@ c.GAS_MULT=Number(e.WIZ_GAS_MULT);
 if(e.WIZ_GAS_MODE==="fixed")c.GAS_GWEI=Number(e.WIZ_GAS_FIXED);else c.GAS_GWEI=null;
 c.MINER_ENABLED=String(e.WIZ_MINER)==="1";
 c.MINER_USD=Number(e.WIZ_MINER_USD);
+c.MINER_MODE=String(e.WIZ_MINER_MODE||"old");
 c.CLAIM_WIN=String(e.WIZ_CLAIM_WIN)==="1";
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
@@ -788,7 +805,7 @@ try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { tr
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_CLAIM_WIN') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }

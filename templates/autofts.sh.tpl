@@ -269,7 +269,7 @@ fi
 WIZ_ROOMS="0,1,2"; WIZ_MIN="30"; WIZ_MAX="60"; WIZ_DELAY="0"
 WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
 WIZ_CLAIM="30"; WIZ_BNB="0.005"
-WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_CLAIM_WIN="1"
+WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
 
 # ---- 读现有 config.json 作为默认值 ----
 wiz_load() {
@@ -297,6 +297,7 @@ wiz_load() {
       MINER_ENABLED)    if [ "$v" = "1" ]; then WIZ_MINER="1"; else WIZ_MINER="0"; fi ;;
       MINER_USD)        WIZ_MINER_USD="$v" ;;
       CLAIM_WIN)        if [ "$v" = "0" ]; then WIZ_CLAIM_WIN="0"; else WIZ_CLAIM_WIN="1"; fi ;;
+      MINER_MODE)       case "$v" in old|new|both) WIZ_MINER_MODE="$v" ;; esac ;;
     esac
   done < <(node -e '
     const fs=require("fs");
@@ -315,6 +316,7 @@ wiz_load() {
     console.log("MINER_ENABLED="+(c.MINER_ENABLED===true||c.MINER_ENABLED==="true"||c.MINER_ENABLED===1?"1":"0"));
     put("MINER_USD",c.MINER_USD);
     console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
+    put("MINER_MODE",c.MINER_MODE);
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=30
@@ -333,6 +335,7 @@ wiz_load() {
   _is_num "$WIZ_MINER_USD" || WIZ_MINER_USD=100
   case "$WIZ_MINER" in 0|1) ;; *) WIZ_MINER=0 ;; esac
   case "$WIZ_CLAIM_WIN" in 0|1) ;; *) WIZ_CLAIM_WIN=1 ;; esac
+  case "$WIZ_MINER_MODE" in old|new|both) ;; *) WIZ_MINER_MODE=old ;; esac
   [[ "$WIZ_ROOMS" =~ ^[0-2](,[0-2])*$ ]] || WIZ_ROOMS="0,1,2"
 }
 
@@ -354,11 +357,12 @@ wiz_gas_text() {
 }
 
 wiz_miner_text() {
-  if [ "$WIZ_MINER" = "1" ]; then
-    echo "开(老额度达标后组机，固定付 ${WIZ_MINER_USD} USDT)"
-  else
-    echo "关"
-  fi
+  if [ "$WIZ_MINER" != "1" ]; then echo "关"; return; fi
+  case "$WIZ_MINER_MODE" in
+    new)  echo "开(新版: 按矿机额度实额支付)" ;;
+    both) echo "开(新版按额度 + 老系统固定 ${WIZ_MINER_USD} USDT)" ;;
+    *)    echo "开(老系统: 固定付 ${WIZ_MINER_USD} USDT)" ;;
+  esac
 }
 
 wiz_claimwin_text() {
@@ -499,8 +503,19 @@ wiz_edit_miner() {
   read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
   if [ "$ch" = "1" ]; then
     WIZ_MINER="1"
-    wiz_ask_dec "组机固定支付(USDT)" "$WIZ_MINER_USD" 1 10000
-    WIZ_MINER_USD="$REPLY"
+    echo ""
+    echo "    组机模式: 老额度按固定 100U 支付；新版额度按额度实额支付"
+    echo "      [1] 只用老额度(固定金额)   [2] 只用新版额度   [3] 两者都组"
+    read -r -p "    请选择 [1/2/3]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    case "$ch" in
+      2) WIZ_MINER_MODE="new" ;;
+      3) WIZ_MINER_MODE="both" ;;
+      *) WIZ_MINER_MODE="old" ;;
+    esac
+    if [ "$WIZ_MINER_MODE" != "new" ]; then
+      wiz_ask_dec "老系统组机固定支付(USDT)" "$WIZ_MINER_USD" 1 10000
+      WIZ_MINER_USD="$REPLY"
+    fi
   else
     WIZ_MINER="0"
   fi
@@ -596,7 +611,7 @@ wiz_defaults() {
       WIZ_ROOMS="0,1,2"; WIZ_MIN="30"; WIZ_MAX="60"; WIZ_DELAY="0"
       WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
       WIZ_CLAIM="30"; WIZ_BNB="0.005"
-      WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_CLAIM_WIN="1"
+      WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
   esac
@@ -613,7 +628,7 @@ wiz_commit() {
   WIZ_ROOMS="$WIZ_ROOMS" WIZ_MIN="$WIZ_MIN" WIZ_MAX="$WIZ_MAX" WIZ_DELAY="$WIZ_DELAY" \
   WIZ_GAS_MODE="$WIZ_GAS_MODE" WIZ_GAS_FIXED="$WIZ_GAS_FIXED" WIZ_GAS_MAX="$WIZ_GAS_MAX" \
   WIZ_GAS_MULT="$WIZ_GAS_MULT" WIZ_CLAIM="$WIZ_CLAIM" WIZ_BNB="$WIZ_BNB" \
-  WIZ_MINER="$WIZ_MINER" WIZ_MINER_USD="$WIZ_MINER_USD" WIZ_CLAIM_WIN="$WIZ_CLAIM_WIN" \
+  WIZ_MINER="$WIZ_MINER" WIZ_MINER_USD="$WIZ_MINER_USD" WIZ_MINER_MODE="$WIZ_MINER_MODE" WIZ_CLAIM_WIN="$WIZ_CLAIM_WIN" \
   node -e '
     const fs = require("fs");
     let c = {};
@@ -631,6 +646,7 @@ wiz_commit() {
     else c.GAS_GWEI = null;
     c.MINER_ENABLED = String(e.WIZ_MINER) === "1";
     c.MINER_USD = Number(e.WIZ_MINER_USD);
+    c.MINER_MODE = String(e.WIZ_MINER_MODE || "old");
     c.CLAIM_WIN = String(e.WIZ_CLAIM_WIN) === "1";
     const tmp = "config.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(c, null, 2) + "\n");

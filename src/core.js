@@ -155,6 +155,8 @@ const CFG = {
     return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
   })(),
   MINER_USD: cfgNum(process.env.FTS_MINER_USD ?? userCfg.MINER_USD, 100, 'MINER_USD'),
+  // 组矿机模式: old=只用老额度(固定 MINER_USD)、new=只用新版额度(按额度实额支付)、both=两者都组
+  MINER_MODE: String(process.env.FTS_MINER_MODE || userCfg.MINER_MODE || 'old').toLowerCase(),
   MINER_ROOM: cfgNum(process.env.FTS_MINER_ROOM ?? userCfg.MINER_ROOM, 0, 'MINER_ROOM'),
   MINER_CHECK_MS: cfgNum(process.env.FTS_MINER_CHECK_MS ?? userCfg.MINER_CHECK_MS, 60000, 'MINER_CHECK_MS'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
@@ -228,6 +230,10 @@ function validateCfg() {
   if (CFG.MINER_USD >= 1e21) { p.push('MINER_USD 过大，已改为 100'); CFG.MINER_USD = 100; }
   if (!Number.isInteger(CFG.MINER_ROOM) || CFG.MINER_ROOM < 0 || CFG.MINER_ROOM > 255) { p.push(`MINER_ROOM(${CFG.MINER_ROOM}) 必须是 0~255 的整数，已改为 0`); CFG.MINER_ROOM = 0; }
   if (CFG.MINER_CHECK_MS < 10000) { p.push('MINER_CHECK_MS 太小，已改为 10000'); CFG.MINER_CHECK_MS = 10000; }
+  if (!['old', 'new', 'both'].includes(CFG.MINER_MODE)) {
+    p.push(`MINER_MODE 只能是 old/new/both，当前 "${CFG.MINER_MODE}"，已改为 old`);
+    CFG.MINER_MODE = 'old';
+  }
   return p.concat(cfgProblems);
 }
 
@@ -1357,74 +1363,94 @@ async function claimLoop(inst) {
   }
 }
 
-// ---------------- 组矿机(老系统固定金额 formLP) ----------------
-// 需求背景: 新版游戏的矿机额度只能靠"中奖"累积，而中奖与否由 Chainlink VRF 随机决定，
-// 无法在客户端操控。老系统保留了 formLP(uint8 room) 接口: 老额度 >= 房间阈值(通常 100U)后，
-// 固定支付 MINER_USD(默认 100U) + 等值 FTS 即可组机，与本轮额度多少无关。
-// 注意: 老系统已停止新排队，只有历史额度可在这里成机。
+// ---------------- 组矿机(老额度固定100U / 新版按额度) ----------------
+// 背景: 新版矿机额度只能靠中奖(VRF 随机)累积，脚本无法操控。
+//   old : 老系统 formLP，老额度 >= 阈值后固定支付 MINER_USD(默认 100U)，与额度多少无关
+//   new : 新队列 formLP，USDT 腿按当前额度实额支付(额度多少付多少) + 等值 FTS
+//   both: 先新版、再老版(老矿机运行中会挡住新机组装)
+function minerTargets() {
+  const list = [];
+  if (CFG.MINER_MODE === 'new' || CFG.MINER_MODE === 'both') {
+    list.push({ key: 'new', label: '新版(按额度实付)', addr: CFG.QUEUE_ADDR, fixed: false });
+  }
+  if (CFG.MINER_MODE === 'old' || CFG.MINER_MODE === 'both') {
+    list.push({ key: 'old', label: `老系统(固定${CFG.MINER_USD}U)`, addr: CFG.MINER_QUEUE_ADDR, fixed: true });
+  }
+  return list;
+}
+
 async function minerLoop(inst) {
   if (!CFG.MINER_ENABLED) return;
   const room = CFG.MINER_ROOM;
-  const fixed = ethers.parseUnits(String(CFG.MINER_USD), 18);
-  let done = false;
-  let lastLogAt = 0;
+  const fixedUsd = ethers.parseUnits(String(CFG.MINER_USD), 18);
+  const minBnb = ethers.parseEther(String(CFG.MIN_BNB_GAS));
+  const targets = minerTargets().map(t => ({
+    ...t,
+    done: false,
+    lastLogAt: 0,
+    contract: t.key === 'new' ? inst.queue : inst.miner
+  }));
+  if (!targets.length) return;
+
   while (true) {
-    try {
-      if (!done) {
+    for (const t of targets) {
+      if (t.done) continue;
+      try {
         const [rc, quota] = await Promise.all([
-          mgr.rpc(p => inst.miner.roomConfigs(room)),
-          mgr.rpc(p => inst.miner.pendingQuotaUsd(inst.address))
+          mgr.rpc(p => t.contract.roomConfigs(room)),
+          mgr.rpc(p => t.contract.pendingQuotaUsd(inst.address))
         ]);
-        const threshold = rc.quotaThreshold;
-        if (quota < threshold) {
-          if (Date.now() - lastLogAt > 1800000) {
-            lastLogAt = Date.now();
-            info(inst.address, `[矿机] 老系统额度 ${ethers.formatUnits(quota, 18)}U / 需要 ${ethers.formatUnits(threshold, 18)}U，还差 ${ethers.formatUnits(threshold - quota, 18)}U，暂不组机`);
+        const threshold = BigInt(rc.quotaThreshold);
+        if (BigInt(quota) < threshold) {
+          if (Date.now() - t.lastLogAt > 1800000) {
+            t.lastLogAt = Date.now();
+            info(inst.address, `[矿机/${t.label}] 额度 ${ethers.formatUnits(quota, 18)}U / 需要 ${ethers.formatUnits(threshold, 18)}U，还差 ${ethers.formatUnits(threshold - quota, 18)}U，暂不组机`);
           }
-        } else {
-          // 余额检查: 组机要真实支付固定 USDT + gas
-          const [usdtBal, allowance, bnb] = await Promise.all([
-            mgr.rpc(p => inst.usdt.balanceOf(inst.address)),
-            mgr.rpc(p => inst.usdt.allowance(inst.address, CFG.MINER_QUEUE_ADDR)),
-            mgr.rpc(p => inst.provider.getBalance(inst.address))
-          ]);
-          if (usdtBal < fixed) {
-            warnOnce(inst.address, `[矿机] USDT 余额不足: 组机固定需要 ${ethers.formatUnits(fixed, 18)}U，当前 ${ethers.formatUnits(usdtBal, 18)}U，跳过`, 600000);
-          } else if (bnb < ethers.parseEther(String(CFG.MIN_BNB_GAS))) {
-            warnOnce(inst.address, `[矿机] BNB 不足以付 gas(${ethers.formatEther(bnb)} < ${CFG.MIN_BNB_GAS})，跳过组机`, 600000);
-          } else {
-            if (allowance < fixed) {
-              info(inst.address, `[矿机] 授权不足(${ethers.formatUnits(allowance, 18)}U)，先授权 ${CFG.MINER_USD} USDT 给老队列`);
-              const okApprove = await sendTx(inst, {
-                label: `[矿机] USDT 授权 ${CFG.MINER_USD} 给老队列`,
-                contract: inst.usdt,
-                method: 'approve',
-                args: [CFG.MINER_QUEUE_ADDR, fixed]
-              });
-              if (!okApprove) {
-                err(inst.address, '[矿机] 授权失败，稍后重试组机');
-                await sleep(CFG.MINER_CHECK_MS);
-                continue;
-              }
-            }
-            info(inst.address, `[矿机] 老额度 ${ethers.formatUnits(quota, 18)}U 已达标，发起组机(formLP, 固定 ${CFG.MINER_USD}U + 等值 FTS)`);
-            const okTx = await sendTx(inst, {
-              label: `[矿机] 组机 formLP(房间${room}, 固定 ${CFG.MINER_USD}U)`,
-              contract: inst.miner,
-              method: 'formLP',
-              args: [room],
-              noWait: true,
-              onFailed: () => { }
-            });
-            if (okTx) {
-              done = true;
-              ok(inst.address, `[矿机] 组机交易已广播，上链后矿机开始 100 天释放；如需再组请重启脚本`);
-            }
+          continue;
+        }
+        // 老系统固定 MINER_USD；新版按当前额度实额支付
+        const pay = t.fixed ? fixedUsd : BigInt(quota);
+        const [usdtBal, allowance, bnb] = await Promise.all([
+          mgr.rpc(p => inst.usdt.balanceOf(inst.address)),
+          mgr.rpc(p => inst.usdt.allowance(inst.address, t.addr)),
+          mgr.rpc(p => inst.provider.getBalance(inst.address))
+        ]);
+        if (usdtBal < pay) {
+          warnOnce(inst.address, `[矿机/${t.label}] USDT 不足: 需要 ${ethers.formatUnits(pay, 18)}U，当前 ${ethers.formatUnits(usdtBal, 18)}U，跳过`, 600000);
+          continue;
+        }
+        if (bnb < minBnb) {
+          warnOnce(inst.address, `[矿机/${t.label}] BNB 不足以付 gas(${ethers.formatEther(bnb)} < ${CFG.MIN_BNB_GAS})，跳过`, 600000);
+          continue;
+        }
+        if (allowance < pay) {
+          info(inst.address, `[矿机/${t.label}] 授权不足(${ethers.formatUnits(allowance, 18)}U)，先授权 ${ethers.formatUnits(pay, 18)} USDT`);
+          const okApprove = await sendTx(inst, {
+            label: `[矿机/${t.label}] USDT 授权 ${ethers.formatUnits(pay, 18)}`,
+            contract: inst.usdt,
+            method: 'approve',
+            args: [t.addr, pay]
+          });
+          if (!okApprove) {
+            err(inst.address, `[矿机/${t.label}] 授权失败，稍后重试`);
+            continue;
           }
         }
+        info(inst.address, `[矿机/${t.label}] 额度 ${ethers.formatUnits(quota, 18)}U 已达标，发起 formLP(房间${room}, 另付 ${ethers.formatUnits(pay, 18)}U + 等值 FTS)`);
+        const okTx = await sendTx(inst, {
+          label: `[矿机/${t.label}] formLP(房间${room}, ${ethers.formatUnits(pay, 18)}U)`,
+          contract: t.contract,
+          method: 'formLP',
+          args: [room],
+          noWait: true
+        });
+        if (okTx) {
+          t.done = true;
+          ok(inst.address, `[矿机/${t.label}] 组机交易已广播，矿机开始 100 天释放；需要再组请重启脚本`);
+        }
+      } catch (e) {
+        errOnce(inst.address, `[矿机/${t.label}] 流程异常: ` + formatError(e), 120000);
       }
-    } catch (e) {
-      errOnce(inst.address, '[矿机] 流程异常: ' + formatError(e), 120000);
     }
     await sleep(CFG.MINER_CHECK_MS + Math.random() * 8000);
   }
@@ -1540,17 +1566,20 @@ async function selftest() {
     if (allow === 0n) console.log('   ⚠️ 授权为 0，首次入场会自动发起"单轮票价"授权交易');
     // 老系统矿机额度: 只有达到房间阈值才能 formLP 组机(与中奖无关，靠历史中奖累积)
     if (CFG.MINER_ENABLED) {
-      try {
-        const minQ = new ethers.Contract(CFG.MINER_QUEUE_ADDR, QUEUE_ABI, mgr.provider);
-        const [q, rc] = await Promise.all([
-          minQ.pendingQuotaUsd(w.ADDRESS),
-          minQ.roomConfigs(CFG.MINER_ROOM)
-        ]);
-        const canForm = q >= rc.quotaThreshold;
-        console.log(`   矿机组装: 老额度 ${ethers.formatUnits(q, 18)}U / 阈值 ${ethers.formatUnits(rc.quotaThreshold, 18)}U -> ` +
-          (canForm ? `✅ 可组机(固定支付 ${CFG.MINER_USD}U)` : '⏳ 额度不足，暂不可组机(无法靠脚本操控中奖累积)'));
-      } catch (e) {
-        console.log('   矿机额度读取失败: ' + formatError(e));
+      for (const t of minerTargets()) {
+        try {
+          const c = new ethers.Contract(t.addr, QUEUE_ABI, mgr.provider);
+          const [q, rc] = await Promise.all([
+            c.pendingQuotaUsd(w.ADDRESS),
+            c.roomConfigs(CFG.MINER_ROOM)
+          ]);
+          const canForm = BigInt(q) >= BigInt(rc.quotaThreshold);
+          const payDesc = t.fixed ? `固定 ${CFG.MINER_USD}U` : `按额度 ${ethers.formatUnits(q, 18)}U`;
+          console.log(`   矿机组装[${t.label}]: 额度 ${ethers.formatUnits(q, 18)}U / 阈值 ${ethers.formatUnits(rc.quotaThreshold, 18)}U -> ` +
+            (canForm ? `✅ 可组机(${payDesc})` : '⏳ 额度不足，暂不可组机'));
+        } catch (e) {
+          console.log(`   矿机组装[${t.label}] 读取失败: ` + formatError(e));
+        }
       }
     }
   }
@@ -1644,7 +1673,7 @@ async function main() {
     ? `固定 ${CFG.GAS_FIXED_GWEI} gwei`
     : `自动 ×${CFG.GAS_MULT} (上限 ${CFG.GAS_MAX_GWEI} gwei)`;
   info('SYS', `FTS 引擎 v${VERSION} 启动 | 模式=${MODE} | 房间=${CFG.ROOMS.join(',')} | 抢位=[${CFG.SNIPE_MIN_COUNT},${CFG.SNIPE_MAX_COUNT}) | 延迟=${CFG.SNIPE_DELAY_MS}ms | 手续费=${gasDesc}`);
-  info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `开(老队列 ${CFG.MINER_QUEUE_ADDR} 固定 ${CFG.MINER_USD}U)` : '关'}`);
+  info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `${CFG.MINER_MODE}(固定${CFG.MINER_USD}U/老队列 ${CFG.MINER_QUEUE_ADDR})` : '关'}`);
   const wallets = loadWallets();
   if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); exitFlush(21); return; }
   try { fs.chmodSync(WALLETS_FILE, 0o600); } catch (e) { }
