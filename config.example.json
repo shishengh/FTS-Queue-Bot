@@ -7,5 +7,9 @@
   "GAS_MAX_GWEI": 10,
   "GAS_MULT": 1.25,
   "CLAIM_INTERVAL_MS": 30000,
-  "MIN_BNB_GAS": 0.005
+  "MIN_BNB_GAS": 0.005,
+  "CLAIM_WIN": true,
+  "MINER_ENABLED": false,
+  "MINER_USD": 100,
+  "MINER_ROOM": 0
 }

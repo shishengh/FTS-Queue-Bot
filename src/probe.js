@@ -30,7 +30,7 @@ const ROOT = __dirname;
 let userCfg = {};
 try { userCfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8').replace(/^﻿/, '')); } catch (e) { }
 
-const TARGET = process.argv[2] || process.env.FTS_QUEUE_ADDR || userCfg.QUEUE_ADDR || '0x88E6A7fA7eaCBdf774496A15304a7fDB0A16f301';
+const TARGET = process.argv[2] || process.env.FTS_QUEUE_ADDR || userCfg.QUEUE_ADDR || '0xe2E751cF79A5Ce03fED12Abf15acFA7383E296bF';
 const USDT_ADDR = process.env.FTS_USDT_ADDR || userCfg.USDT_ADDR || '0x55d398326f99059fF775485246999027B3197955';
 const WATCH_ADDR = process.argv[3] || process.env.FTS_WATCH_ADDR || '';
 const CHAIN_ID = Number(process.env.FTS_CHAIN_ID || userCfg.CHAIN_ID || 56);
@@ -61,10 +61,15 @@ const CANDIDATES = {
   roundInfo: ['roundInfo(uint8,uint256)', 'roundInfo(uint256,uint256)', 'roundInfo(uint256)', 'roundInfo(uint8,uint256,address)', 'roundInfo(uint256,address)'],
   roomConfigs: ['roomConfigs(uint8)', 'roomConfigs(uint256)', 'roomConfigs()', 'roomConfigs(uint8,uint256)'],
   enterQueue: ['enterQueue(uint8,address)', 'enterQueue(uint256,address)', 'enterQueue(address)', 'enterQueue(uint8,address,uint256)', 'enterQueue(uint256)'],
-  claimRefundAndAirdrop: ['claimRefundAndAirdrop(uint8,uint256)', 'claimRefundAndAirdrop(uint256,uint256)', 'claimRefundAndAirdrop(uint256)', 'claimRefundAndAirdrop()', 'claimRefundAndAirdrop(uint8,uint256,address)']
+  claimRefundAndAirdrop: ['claimRefundAndAirdrop(uint8,uint256)', 'claimRefundAndAirdrop(uint256,uint256)', 'claimRefundAndAirdrop(uint256)', 'claimRefundAndAirdrop()', 'claimRefundAndAirdrop(uint8,uint256,address)'],
+  claimRefundOnly: ['claimRefundOnly(uint8,uint256)', 'claimRefundOnly(uint256,uint256)', 'claimRefundOnly(uint256)'],
+  claimWin: ['claimWin(uint8,uint256,uint256)', 'claimWin(uint8,uint256)', 'claimWin(uint256,uint256,uint256)'],
+  formLP: ['formLP(uint8)', 'formLP(uint256)'],
+  roomCount: ['roomCount()'],
+  pendingQuotaUsd: ['pendingQuotaUsd(address)']
 };
 // 写函数没有返回值，eth_call 通常返回空 -> 只能靠"字节码里有没有这个 selector"判断
-const WRITE_FNS = new Set(['enterQueue', 'claimRefundAndAirdrop']);
+const WRITE_FNS = new Set(['enterQueue', 'claimRefundAndAirdrop', 'claimRefundOnly', 'claimWin', 'formLP']);
 
 const nParams = sig => sig.slice(sig.indexOf('(') + 1, -1).split(',').filter(Boolean).length;
 const selectorOf = sig => { try { return ethers.FunctionFragment.from(sig).selector; } catch (e) { return null; } };
@@ -284,6 +289,13 @@ async function pickRpc() {
       console.log(`  USDT 余额 : ${ethers.formatUnits(usdt, 18)}`);
       const allow = await withTimeout(uRead.allowance(WATCH_ADDR, TARGET), 20000);
       console.log(`  已授权额度: ${ethers.formatUnits(allow, 18)} ${allow === 0n ? Y + '(0，首次入场需先发授权交易)' + D : G + '(已授权)' + D}`);
+      // 老系统矿机额度(只有达到房间阈值才能 formLP 组机)
+      try {
+        const qRead = new ethers.Contract(TARGET, ['function pendingQuotaUsd(address) view returns (uint256)', 'function roomConfigs(uint8 room) view returns (uint256,uint256,uint256,uint256,uint256,bool,uint16,uint16,uint32)'], provider);
+        const q = await withTimeout(qRead.pendingQuotaUsd(WATCH_ADDR), 20000);
+        const rc = await withTimeout(qRead.roomConfigs(0), 20000);
+        console.log(`  矿机额度  : ${ethers.formatUnits(q, 18)}U / 阈值 ${ethers.formatUnits(rc[4], 18)}U`);
+      } catch (e) { /* 新队列也可能没有老额度接口，忽略 */ }
     } catch (e) { console.log(`  ${R}读取失败: ${errText(e)}${D}`); }
   }
 

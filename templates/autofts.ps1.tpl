@@ -385,6 +385,7 @@ if ($Mode -eq 'probe') {
 $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
 $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
+$Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizClaimWin = '1'
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
@@ -409,6 +410,9 @@ console.log("GAS_MODE="+(c.GAS_GWEI===null?"auto":"fixed"));
 put("GAS_GWEI",c.GAS_GWEI);
 put("GAS_MAX_GWEI",c.GAS_MAX_GWEI);
 put("GAS_MULT",c.GAS_MULT);
+console.log("MINER_ENABLED="+(c.MINER_ENABLED===true||c.MINER_ENABLED==="true"||c.MINER_ENABLED===1?"1":"0"));
+put("MINER_USD",c.MINER_USD);
+console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -433,6 +437,9 @@ put("GAS_MULT",c.GAS_MULT);
                 'GAS_GWEI'          { if (Test-IsNum $v) { $Script:WizGasFixed = $v; $Script:WizGasMode = 'fixed' } }
                 'GAS_MAX_GWEI'      { if (Test-IsNum $v) { $Script:WizGasMax = $v } }
                 'GAS_MULT'          { if (Test-IsNum $v) { $Script:WizGasMult = $v } }
+                'MINER_ENABLED'     { if ($v -eq '1') { $Script:WizMiner = '1' } else { $Script:WizMiner = '0' } }
+                'MINER_USD'         { if (Test-IsNum $v) { $Script:WizMinerUsd = $v } }
+                'CLAIM_WIN'         { if ($v -eq '1') { $Script:WizClaimWin = '1' } else { $Script:WizClaimWin = '0' } }
             }
         }
     }
@@ -457,6 +464,16 @@ function Get-RoomsText {
 function Get-GasText {
     if ($Script:WizGasMode -eq 'fixed') { return "固定 $($Script:WizGasFixed) gwei" }
     return "自动(链上价 x$($Script:WizGasMult)，上限 $($Script:WizGasMax) gwei)"
+}
+
+function Get-MinerText {
+    if ($Script:WizMiner -eq '1') { return "开(老额度达标后组机，固定付 $($Script:WizMinerUsd) USDT)" }
+    return '关'
+}
+
+function Get-ClaimWinText {
+    if ($Script:WizClaimWin -eq '1') { return '中奖后自动领取矿机额度' }
+    return '中奖后不领取(放弃该奖励)'
 }
 
 function Get-AccountCount {
@@ -487,6 +504,8 @@ function Show-WizHeader {
     Write-Host "    手续费     : $(Get-GasText)"
     Write-Host "    领取间隔   : $($Script:WizClaim) 秒"
     Write-Host "    最低 BNB   : $($Script:WizBnb)"
+    Write-Host "    组矿机     : $(Get-MinerText)"
+    Write-Host "    中奖处理   : $(Get-ClaimWinText)"
     Write-Host "  ----------------------------------------------------"
 }
 
@@ -577,6 +596,29 @@ function Edit-Bnb {
     Show-WizHeader
     Write-Host "    最低 BNB 余额: 低于这个值只提醒，不中断运行"
     $Script:WizBnb = Ask-Dec "最低 BNB" $Script:WizBnb 0 1
+}
+
+function Edit-Miner {
+    Show-WizHeader
+    Write-Host "    ---- 中奖处理 / 组矿机 ----"
+    Write-Host "      说明: 每轮 100 席抽 2 名中奖者，由链上 VRF 随机决定，脚本无法操控中不中奖。"
+    Write-Host "            中奖 = 门票自动换成 FTS + 获得等额矿机额度(需在 48 小时内领取)。"
+    Write-Host "            老系统保留 formLP 接口: 老额度 >= 房间阈值(通常 100U) 后，"
+    Write-Host "            固定支付 100 USDT + 等值 FTS 即可组机，与额度多少无关。"
+    Write-Host "    当前中奖处理: $(Get-ClaimWinText)"
+    Write-Host "      [1] 中奖后自动领取额度    [2] 中奖后不领取"
+    $cw = Read-Menu "    请选择 [1/2]"
+    $Script:WizClaimWin = if ($cw -eq '2') { '0' } else { '1' }
+    Write-Host ""
+    Write-Host "    当前组矿机: $(Get-MinerText)"
+    Write-Host "      [1] 开启组矿机    [2] 关闭"
+    $ch = Read-Menu "    请选择 [1/2]"
+    if ($ch -eq '1') {
+        $Script:WizMiner = '1'
+        $Script:WizMinerUsd = Ask-Dec "组机固定支付(USDT)" $Script:WizMinerUsd 1 10000
+    } else {
+        $Script:WizMiner = '0'
+    }
 }
 
 function Add-Account {
@@ -697,6 +739,7 @@ function Reset-Defaults {
         $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
         $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
         $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
+        $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizClaimWin = '1'
         Write-Ok "已恢复默认(尚未保存)"
     } else {
         Write-Host "    已取消"
@@ -718,6 +761,9 @@ function Save-Wiz {
     $env:WIZ_GAS_MULT = $Script:WizGasMult
     $env:WIZ_CLAIM = $Script:WizClaim
     $env:WIZ_BNB = $Script:WizBnb
+    $env:WIZ_MINER = $Script:WizMiner
+    $env:WIZ_MINER_USD = $Script:WizMinerUsd
+    $env:WIZ_CLAIM_WIN = $Script:WizClaimWin
 
     $code = @'
 const fs=require("fs");
@@ -733,13 +779,16 @@ c.MIN_BNB_GAS=Number(e.WIZ_BNB);
 c.GAS_MAX_GWEI=Number(e.WIZ_GAS_MAX);
 c.GAS_MULT=Number(e.WIZ_GAS_MULT);
 if(e.WIZ_GAS_MODE==="fixed")c.GAS_GWEI=Number(e.WIZ_GAS_FIXED);else c.GAS_GWEI=null;
+c.MINER_ENABLED=String(e.WIZ_MINER)==="1";
+c.MINER_USD=Number(e.WIZ_MINER_USD);
+c.CLAIM_WIN=String(e.WIZ_CLAIM_WIN)==="1";
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
 try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_CLAIM_WIN') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
@@ -781,7 +830,8 @@ function Invoke-Wizard {
         Write-Host "      [3] 抢单延迟          [4] 手续费 / Gas"
         Write-Host "      [5] 领取返利间隔      [6] 最低 BNB 余额"
         Write-Host "      [7] 账号管理          [8] 恢复默认值"
-        Write-Host "      [9] 保存并退出        [0] 不保存退出"
+        Write-Host "      [9] 中奖处理/组矿机   [10] 保存并退出"
+        Write-Host "      [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
         $ch = Read-Menu "    请选择"
         switch ($ch) {
@@ -793,7 +843,8 @@ function Invoke-Wizard {
             '6' { Edit-Bnb }
             '7' { Show-Accounts }
             '8' { Reset-Defaults }
-            '9' { if (Save-Wiz) { return $true } }
+            '9' { Edit-Miner }
+            '10' { if (Save-Wiz) { return $true } }
             '0' { Write-Host ""; Write-Host "  已退出，未做任何修改"; return $false }
         }
     }

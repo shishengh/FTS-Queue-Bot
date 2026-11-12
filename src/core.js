@@ -20,7 +20,7 @@ const path = require('path');
 const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
-const VERSION = '2.0-hardened';
+const VERSION = '2.1-v8';
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
   ? 'powershell -ExecutionPolicy Bypass -File autofts.ps1'
@@ -75,8 +75,11 @@ function cfgStr(v, dflt, name) {
 }
 
 const CFG = {
-  QUEUE_ADDR: process.env.FTS_QUEUE_ADDR || cfgStr(userCfg.QUEUE_ADDR, '0x88E6A7fA7eaCBdf774496A15304a7fDB0A16f301', 'QUEUE_ADDR'),
+  // v8 队列(2026-11 网站改版后的正式队列)。旧地址 0x88E6... 已降级为 legacyQueueV7，房间全部停用。
+  QUEUE_ADDR: process.env.FTS_QUEUE_ADDR || cfgStr(userCfg.QUEUE_ADDR, '0xe2E751cF79A5Ce03fED12Abf15acFA7383E296bF', 'QUEUE_ADDR'),
   USDT_ADDR: process.env.FTS_USDT_ADDR || cfgStr(userCfg.USDT_ADDR, '0x55d398326f99059fF775485246999027B3197955', 'USDT_ADDR'),
+  // 老系统队列: 老额度 >= 阈值后在这里 formLP 组矿机，固定 100U(与额度多少无关)
+  MINER_QUEUE_ADDR: process.env.FTS_MINER_QUEUE || cfgStr(userCfg.MINER_QUEUE_ADDR, '0x94DbcCFC460FA428755F0392ff282B83696B277d', 'MINER_QUEUE_ADDR'),
   CHAIN_ID: cfgNum(process.env.FTS_CHAIN_ID ?? userCfg.CHAIN_ID, 56, 'CHAIN_ID'),
   // 房间 0=10U 1=50U 2=100U，全部启用；可用 FTS_ROOMS=0,1 缩小范围
   ROOMS: (process.env.FTS_ROOMS
@@ -139,6 +142,21 @@ const CFG = {
     ? cfgNum(process.env.FTS_APPROVE_USD ?? userCfg.APPROVE_USD, 0, 'APPROVE_USD')
     : null,                                   // null = 自动按票价 × APPROVE_ROUNDS
   APPROVE_ROUNDS: cfgNum(process.env.FTS_APPROVE_ROUNDS ?? userCfg.APPROVE_ROUNDS, 1, 'APPROVE_ROUNDS'),
+  // 中奖后是否自动领取矿机额度(claimWin)。中奖与否由 Chainlink VRF 随机决定，脚本无法干预。
+  CLAIM_WIN: (() => {
+    const raw = process.env.FTS_CLAIM_WIN ?? userCfg.CLAIM_WIN;
+    if (raw === undefined || raw === null || raw === '') return true;
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
+  // ---- 组矿机(老系统固定 100U 接口 formLP) ----
+  MINER_ENABLED: (() => {
+    const raw = process.env.FTS_MINER_ENABLED ?? userCfg.MINER_ENABLED;
+    if (raw === undefined || raw === null || raw === '') return false;
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
+  MINER_USD: cfgNum(process.env.FTS_MINER_USD ?? userCfg.MINER_USD, 100, 'MINER_USD'),
+  MINER_ROOM: cfgNum(process.env.FTS_MINER_ROOM ?? userCfg.MINER_ROOM, 0, 'MINER_ROOM'),
+  MINER_CHECK_MS: cfgNum(process.env.FTS_MINER_CHECK_MS ?? userCfg.MINER_CHECK_MS, 60000, 'MINER_CHECK_MS'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
@@ -206,6 +224,10 @@ function validateCfg() {
     }
   }
   if (CFG.GAP_STUCK_MS < 15000) { p.push('GAP_STUCK_MS 太小(容易误判)，已改为 15000'); CFG.GAP_STUCK_MS = 15000; }
+  if (CFG.MINER_USD <= 0) { p.push(`MINER_USD(${CFG.MINER_USD}) 必须大于 0，已改为 100`); CFG.MINER_USD = 100; }
+  if (CFG.MINER_USD >= 1e21) { p.push('MINER_USD 过大，已改为 100'); CFG.MINER_USD = 100; }
+  if (!Number.isInteger(CFG.MINER_ROOM) || CFG.MINER_ROOM < 0 || CFG.MINER_ROOM > 255) { p.push(`MINER_ROOM(${CFG.MINER_ROOM}) 必须是 0~255 的整数，已改为 0`); CFG.MINER_ROOM = 0; }
+  if (CFG.MINER_CHECK_MS < 10000) { p.push('MINER_CHECK_MS 太小，已改为 10000'); CFG.MINER_CHECK_MS = 10000; }
   return p.concat(cfgProblems);
 }
 
@@ -297,6 +319,12 @@ const QUEUE_ABI = [
   'function roomConfigs(uint8 room) view returns (uint256 ticketPrice, uint256 maxCapacity, uint256 winnerCount, uint256 loserAirdropUsd, uint256 quotaThreshold, bool enabled, uint16 dailyRoundLimit, uint16 todayRounds, uint32 todayRoundsDay)',
   'function enterQueue(uint8 room, address referrer)',
   'function claimRefundAndAirdrop(uint8 room, uint256 roundIndex)',
+  'function claimRefundOnly(uint8 room, uint256 roundIndex)',
+  'function claimWin(uint8 room, uint256 roundId, uint256 minFtsOut)',
+  'function formLP(uint8 room)',
+  'function pendingQuotaUsd(address) view returns (uint256)',
+  'function quotaMigrated(address) view returns (bool)',
+  'function roomCount() view returns (uint8)',
   'function allowance(address owner, address spender) view returns (uint256)' // 仅用于兼容性探测
 ];
 const USDT_ABI = [
@@ -455,21 +483,32 @@ function bind(inst, provider) {
   inst.wallet = new ethers.Wallet(inst.pk, provider);
   inst.queue = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, inst.wallet);
   inst.usdt = new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, inst.wallet);
+  inst.miner = new ethers.Contract(CFG.MINER_QUEUE_ADDR, QUEUE_ABI, inst.wallet);
 }
 mgr.onRotate(p => instances.forEach(i => bind(i, p)));
 
 // ---------------- WebSocket 可用性 ----------------
 function ensureWebSocket() {
-  if (typeof globalThis.WebSocket !== 'undefined') return true;
+  // Node 22+ 自带 WebSocket(undici 实现)，但它只有 addEventListener，没有 .on()，
+  // 而 ethers 的 WebSocketProvider 依赖 .on('block') -> 会抛 "provider.websocket.on is not a function"。
+  // 所以优先注入 ws 模块(有完整 EventEmitter 接口)，失败才退回内置实现。
   try {
     const wsmod = require('ws');
-    globalThis.WebSocket = wsmod.WebSocket || wsmod;
-    info('SYS', '已注入 ws 模块作为 WebSocket 实现');
+    const WS = wsmod.WebSocket || wsmod;
+    if (WS && WS.prototype && typeof WS.prototype.on === 'function') {
+      if (globalThis.WebSocket !== WS) {
+        globalThis.WebSocket = WS;
+        info('SYS', '已注入 ws 模块作为 WebSocket 实现(兼容 ethers)');
+      }
+      return true;
+    }
+  } catch (e) { /* 没有 ws 就继续往下走 */ }
+  if (typeof globalThis.WebSocket !== 'undefined') {
+    warnOnce('SYS', '当前 WebSocket 实现可能不兼容 ethers(缺少 .on)，建议 npm install ws；已用 HTTP 轮询兜底', 300000);
     return true;
-  } catch (e) {
-    warn('SYS', 'WebSocket 不可用(缺少 ws)，将使用 HTTP 轮询模式兜底。修复: npm install ws');
-    return false;
   }
+  warn('SYS', 'WebSocket 不可用(缺少 ws)，将使用 HTTP 轮询模式兜底。修复: npm install ws');
+  return false;
 }
 
 // ---------------- 区块流: WS 优先 + 轮询兜底 ----------------
@@ -1236,21 +1275,59 @@ async function claimLoop(inst) {
           try { rec = await getRoundInfo(inst, room, r); }
           catch (e) { continue; }               // 单轮读取失败不影响其他轮次
           if (rec.count <= 0) continue;         // 空轮次，无人可退
-          if (rec.winners.includes(inst.address.toLowerCase())) continue; // 中奖者不退款
+          const isWinner = rec.winners.includes(inst.address.toLowerCase());
+
+          // 中奖者: v8 的奖励是"矿机额度"(claimWin)，不再是退款。
+          // 注意: 中奖与否由 Chainlink VRF 随机决定，客户端无法干预，只能决定领不领。
+          if (isWinner) {
+            if (!CFG.CLAIM_WIN) {
+              if (rec.state !== 0) inst.claimed.add(ck);
+              continue;
+            }
+            let canWin = true;
+            try {
+              await mgr.rpc(p => inst.queue.claimWin.staticCall(room, r, 0, { from: inst.address }));
+            } catch (e) {
+              canWin = false;
+              const hardFail = e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null;
+              // 已领过 / 领取窗口过期(48h) 才永久跳过；网络抖动留待下次
+              if (hardFail && rec.state !== 0) inst.claimed.add(ck);
+              else if (!hardFail) warnOnce(inst.address, `[房间${room}] 轮次${r} 中奖预检遇到网络问题，稍后重试: ${formatError(e).slice(0, 120)}`, 60000);
+            }
+            if (!canWin) continue;
+            const okWin = await sendTx(inst, {
+              label: `[房间${room}] 领取中奖额度 轮次${r}`,
+              contract: inst.queue,
+              method: 'claimWin',
+              args: [room, r, 0],
+              noWait: true,
+              onFailed: () => { inst.claimed.delete(ck); }
+            });
+            if (okWin) inst.claimed.add(ck);
+            continue;
+          }
 
           // 预检: 不报错就说明可领。报错(Queue: not in round / claimed 等)静默跳过
           let claimable = true;
+          let method = 'claimRefundAndAirdrop';
           try {
             await mgr.rpc(p => inst.queue.claimRefundAndAirdrop.staticCall(room, r, { from: inst.address }));
           } catch (e) {
-            claimable = false;
-            // 关键: 只有"合约明确拒绝"(revert) 才能永久跳过。
-            // 节点超时 / 429 / 网络抖动 属于软失败，一旦标记永久，这个账号就
-            // 永远漏掉这笔退款/空投了，而且没有任何补救机会。
             const hardFail = e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null;
-            if (hardFail && rec.state !== 0) inst.claimed.add(ck);
-            else if (!hardFail) {
+            if (!hardFail) {
+              claimable = false;
               warnOnce(inst.address, `[房间${room}] 轮次${r} 预检遇到网络问题，稍后重试(不标记已领): ${formatError(e).slice(0, 120)}`, 60000);
+            } else {
+              // "退款+空投"不可用时，可能是超时全员退款轮次(只能退本金) -> 再试 claimRefundOnly
+              try {
+                await mgr.rpc(p => inst.queue.claimRefundOnly.staticCall(room, r, { from: inst.address }));
+                method = 'claimRefundOnly';
+              } catch (e2) {
+                claimable = false;
+                const hard2 = e2.code === 'CALL_EXCEPTION' || decodeRevert(e2) !== null;
+                if (hard2 && rec.state !== 0) inst.claimed.add(ck);
+                else if (!hard2) warnOnce(inst.address, `[房间${room}] 轮次${r} 退款预检遇到网络问题，稍后重试(不标记已领): ${formatError(e2).slice(0, 120)}`, 60000);
+              }
             }
           }
           if (!claimable) continue;
@@ -1258,9 +1335,11 @@ async function claimLoop(inst) {
           // 领取不等上链: 广播成功即返回，确认在后台进行。
           // 这样领取不会占用 nonce 锁长达数十秒，抢单雷达始终在线。
           const okTx = await sendTx(inst, {
-            label: `[房间${room}] 领取返利 轮次${r}(state=${rec.state})`,
+            label: method === 'claimRefundOnly'
+              ? `[房间${room}] 领取退款 轮次${r}(state=${rec.state})`
+              : `[房间${room}] 领取返利 轮次${r}(state=${rec.state})`,
             contract: inst.queue,
-            method: 'claimRefundAndAirdrop',
+            method,
             args: [room, r],
             noWait: true,
             onFailed: () => { inst.claimed.delete(ck); }  // 上链失败就撤标记，下轮重试
@@ -1278,6 +1357,79 @@ async function claimLoop(inst) {
   }
 }
 
+// ---------------- 组矿机(老系统固定金额 formLP) ----------------
+// 需求背景: 新版游戏的矿机额度只能靠"中奖"累积，而中奖与否由 Chainlink VRF 随机决定，
+// 无法在客户端操控。老系统保留了 formLP(uint8 room) 接口: 老额度 >= 房间阈值(通常 100U)后，
+// 固定支付 MINER_USD(默认 100U) + 等值 FTS 即可组机，与本轮额度多少无关。
+// 注意: 老系统已停止新排队，只有历史额度可在这里成机。
+async function minerLoop(inst) {
+  if (!CFG.MINER_ENABLED) return;
+  const room = CFG.MINER_ROOM;
+  const fixed = ethers.parseUnits(String(CFG.MINER_USD), 18);
+  let done = false;
+  let lastLogAt = 0;
+  while (true) {
+    try {
+      if (!done) {
+        const [rc, quota] = await Promise.all([
+          mgr.rpc(p => inst.miner.roomConfigs(room)),
+          mgr.rpc(p => inst.miner.pendingQuotaUsd(inst.address))
+        ]);
+        const threshold = rc.quotaThreshold;
+        if (quota < threshold) {
+          if (Date.now() - lastLogAt > 1800000) {
+            lastLogAt = Date.now();
+            info(inst.address, `[矿机] 老系统额度 ${ethers.formatUnits(quota, 18)}U / 需要 ${ethers.formatUnits(threshold, 18)}U，还差 ${ethers.formatUnits(threshold - quota, 18)}U，暂不组机`);
+          }
+        } else {
+          // 余额检查: 组机要真实支付固定 USDT + gas
+          const [usdtBal, allowance, bnb] = await Promise.all([
+            mgr.rpc(p => inst.usdt.balanceOf(inst.address)),
+            mgr.rpc(p => inst.usdt.allowance(inst.address, CFG.MINER_QUEUE_ADDR)),
+            mgr.rpc(p => inst.provider.getBalance(inst.address))
+          ]);
+          if (usdtBal < fixed) {
+            warnOnce(inst.address, `[矿机] USDT 余额不足: 组机固定需要 ${ethers.formatUnits(fixed, 18)}U，当前 ${ethers.formatUnits(usdtBal, 18)}U，跳过`, 600000);
+          } else if (bnb < ethers.parseEther(String(CFG.MIN_BNB_GAS))) {
+            warnOnce(inst.address, `[矿机] BNB 不足以付 gas(${ethers.formatEther(bnb)} < ${CFG.MIN_BNB_GAS})，跳过组机`, 600000);
+          } else {
+            if (allowance < fixed) {
+              info(inst.address, `[矿机] 授权不足(${ethers.formatUnits(allowance, 18)}U)，先授权 ${CFG.MINER_USD} USDT 给老队列`);
+              const okApprove = await sendTx(inst, {
+                label: `[矿机] USDT 授权 ${CFG.MINER_USD} 给老队列`,
+                contract: inst.usdt,
+                method: 'approve',
+                args: [CFG.MINER_QUEUE_ADDR, fixed]
+              });
+              if (!okApprove) {
+                err(inst.address, '[矿机] 授权失败，稍后重试组机');
+                await sleep(CFG.MINER_CHECK_MS);
+                continue;
+              }
+            }
+            info(inst.address, `[矿机] 老额度 ${ethers.formatUnits(quota, 18)}U 已达标，发起组机(formLP, 固定 ${CFG.MINER_USD}U + 等值 FTS)`);
+            const okTx = await sendTx(inst, {
+              label: `[矿机] 组机 formLP(房间${room}, 固定 ${CFG.MINER_USD}U)`,
+              contract: inst.miner,
+              method: 'formLP',
+              args: [room],
+              noWait: true,
+              onFailed: () => { }
+            });
+            if (okTx) {
+              done = true;
+              ok(inst.address, `[矿机] 组机交易已广播，上链后矿机开始 100 天释放；如需再组请重启脚本`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      errOnce(inst.address, '[矿机] 流程异常: ' + formatError(e), 120000);
+    }
+    await sleep(CFG.MINER_CHECK_MS + Math.random() * 8000);
+  }
+}
+
 // ---------------- 自检 ----------------
 let selftestWallets = [];
 async function selftest() {
@@ -1289,7 +1441,7 @@ async function selftest() {
   try { await mgr.pickBest(); } catch (e) { fatal('SYS', formatError(e)); exitFlush(1); return; }
 
   console.log('\n--- 2. 合约存在性 ---');
-  for (const [name, addr] of [['QUEUE', CFG.QUEUE_ADDR], ['USDT', CFG.USDT_ADDR]]) {
+  for (const [name, addr] of [['QUEUE', CFG.QUEUE_ADDR], ['USDT', CFG.USDT_ADDR], ['MINER_QUEUE', CFG.MINER_QUEUE_ADDR]]) {
     const code = await mgr.rpc(p => p.getCode(addr));
     console.log(`  ${name} ${addr}: ${code && code !== '0x' ? '有合约代码 (长度 ' + code.length + ')' : '❌ 无合约代码，地址可能错误'}`);
   }
@@ -1302,6 +1454,7 @@ async function selftest() {
   const qRead = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, mgr.provider);
   const uRead = new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, mgr.provider);
   await probe('QUEUE.currentRound(0)', () => qRead.currentRound(0));
+  await probe('QUEUE.roomCount()', () => qRead.roomCount());
   // 逐个房间体检(0=10U 1=50U 2=100U)，房间不存在/未启用要能一眼看出
   const roomOk = {};
   for (const room of CFG.ROOMS) {
@@ -1385,6 +1538,21 @@ async function selftest() {
       if (!okBal) allReady = false;
     }
     if (allow === 0n) console.log('   ⚠️ 授权为 0，首次入场会自动发起"单轮票价"授权交易');
+    // 老系统矿机额度: 只有达到房间阈值才能 formLP 组机(与中奖无关，靠历史中奖累积)
+    if (CFG.MINER_ENABLED) {
+      try {
+        const minQ = new ethers.Contract(CFG.MINER_QUEUE_ADDR, QUEUE_ABI, mgr.provider);
+        const [q, rc] = await Promise.all([
+          minQ.pendingQuotaUsd(w.ADDRESS),
+          minQ.roomConfigs(CFG.MINER_ROOM)
+        ]);
+        const canForm = q >= rc.quotaThreshold;
+        console.log(`   矿机组装: 老额度 ${ethers.formatUnits(q, 18)}U / 阈值 ${ethers.formatUnits(rc.quotaThreshold, 18)}U -> ` +
+          (canForm ? `✅ 可组机(固定支付 ${CFG.MINER_USD}U)` : '⏳ 额度不足，暂不可组机(无法靠脚本操控中奖累积)'));
+      } catch (e) {
+        console.log('   矿机额度读取失败: ' + formatError(e));
+      }
+    }
   }
 
   console.log('\n--- 5. 交易预演 (不上链，一分钱不花) ---');
@@ -1476,6 +1644,7 @@ async function main() {
     ? `固定 ${CFG.GAS_FIXED_GWEI} gwei`
     : `自动 ×${CFG.GAS_MULT} (上限 ${CFG.GAS_MAX_GWEI} gwei)`;
   info('SYS', `FTS 引擎 v${VERSION} 启动 | 模式=${MODE} | 房间=${CFG.ROOMS.join(',')} | 抢位=[${CFG.SNIPE_MIN_COUNT},${CFG.SNIPE_MAX_COUNT}) | 延迟=${CFG.SNIPE_DELAY_MS}ms | 手续费=${gasDesc}`);
+  info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `开(老队列 ${CFG.MINER_QUEUE_ADDR} 固定 ${CFG.MINER_USD}U)` : '关'}`);
   const wallets = loadWallets();
   if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); exitFlush(21); return; }
   try { fs.chmodSync(WALLETS_FILE, 0o600); } catch (e) { }
@@ -1510,6 +1679,7 @@ async function main() {
   for (const inst of instances) {
     startGapFixer(inst);   // nonce 断档自愈
     claimLoop(inst);
+    if (CFG.MINER_ENABLED) minerLoop(inst);
   }
 
   const stream = new BlockStream();

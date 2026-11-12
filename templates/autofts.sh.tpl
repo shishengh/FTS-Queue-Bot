@@ -269,6 +269,7 @@ fi
 WIZ_ROOMS="0,1,2"; WIZ_MIN="30"; WIZ_MAX="60"; WIZ_DELAY="0"
 WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
 WIZ_CLAIM="30"; WIZ_BNB="0.005"
+WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_CLAIM_WIN="1"
 
 # ---- 读现有 config.json 作为默认值 ----
 wiz_load() {
@@ -293,6 +294,9 @@ wiz_load() {
       GAS_GWEI)         WIZ_GAS_FIXED="$v"; WIZ_GAS_MODE="fixed" ;;
       GAS_MAX_GWEI)     WIZ_GAS_MAX="$v" ;;
       GAS_MULT)         WIZ_GAS_MULT="$v" ;;
+      MINER_ENABLED)    if [ "$v" = "1" ]; then WIZ_MINER="1"; else WIZ_MINER="0"; fi ;;
+      MINER_USD)        WIZ_MINER_USD="$v" ;;
+      CLAIM_WIN)        if [ "$v" = "0" ]; then WIZ_CLAIM_WIN="0"; else WIZ_CLAIM_WIN="1"; fi ;;
     esac
   done < <(node -e '
     const fs=require("fs");
@@ -308,6 +312,9 @@ wiz_load() {
     put("GAS_GWEI",c.GAS_GWEI);
     put("GAS_MAX_GWEI",c.GAS_MAX_GWEI);
     put("GAS_MULT",c.GAS_MULT);
+    console.log("MINER_ENABLED="+(c.MINER_ENABLED===true||c.MINER_ENABLED==="true"||c.MINER_ENABLED===1?"1":"0"));
+    put("MINER_USD",c.MINER_USD);
+    console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=30
@@ -323,6 +330,9 @@ wiz_load() {
   _is_num "$WIZ_GAS_MAX"   || WIZ_GAS_MAX=10
   _is_num "$WIZ_GAS_MULT"  || WIZ_GAS_MULT=1.25
   _is_num "$WIZ_GAS_FIXED" || WIZ_GAS_FIXED=0.05
+  _is_num "$WIZ_MINER_USD" || WIZ_MINER_USD=100
+  case "$WIZ_MINER" in 0|1) ;; *) WIZ_MINER=0 ;; esac
+  case "$WIZ_CLAIM_WIN" in 0|1) ;; *) WIZ_CLAIM_WIN=1 ;; esac
   [[ "$WIZ_ROOMS" =~ ^[0-2](,[0-2])*$ ]] || WIZ_ROOMS="0,1,2"
 }
 
@@ -343,6 +353,22 @@ wiz_gas_text() {
   fi
 }
 
+wiz_miner_text() {
+  if [ "$WIZ_MINER" = "1" ]; then
+    echo "开(老额度达标后组机，固定付 ${WIZ_MINER_USD} USDT)"
+  else
+    echo "关"
+  fi
+}
+
+wiz_claimwin_text() {
+  if [ "$WIZ_CLAIM_WIN" = "1" ]; then
+    echo "中奖后自动领取矿机额度"
+  else
+    echo "中奖后不领取(放弃该奖励)"
+  fi
+}
+
 wiz_account_count() {
   node -e 'try{const d=JSON.parse(require("fs").readFileSync("wallets.json","utf8"));console.log((d.wallets||[]).length)}catch(e){console.log(0)}' 2>/dev/null || echo 0
 }
@@ -360,6 +386,8 @@ wiz_header() {
   echo "    手续费     : $(wiz_gas_text)"
   echo "    领取间隔   : ${WIZ_CLAIM} 秒"
   echo "    最低 BNB   : ${WIZ_BNB}"
+  echo "    组矿机     : $(wiz_miner_text)"
+  echo "    中奖处理   : $(wiz_claimwin_text)"
   echo "  ────────────────────────────────────────────────────"
 }
 
@@ -453,6 +481,31 @@ wiz_edit_bnb() {
   WIZ_BNB="$REPLY"
 }
 
+wiz_edit_miner() {
+  local ch
+  wiz_header
+  echo "    ---- 中奖处理 / 组矿机 ----"
+  echo "      说明: 每轮 100 席抽 2 名中奖者，由链上 VRF 随机决定，脚本无法操控中不中奖。"
+  echo "            中奖 = 门票自动换成 FTS + 获得等额矿机额度(需在 48 小时内领取)。"
+  echo "            老系统保留 formLP 接口: 老额度 >= 房间阈值(通常 100U) 后，"
+  echo "            固定支付 100 USDT + 等值 FTS 即可组机，与额度多少无关。"
+  echo "    当前中奖处理: $(wiz_claimwin_text)"
+  echo "      [1] 中奖后自动领取额度    [2] 中奖后不领取"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" = "2" ]; then WIZ_CLAIM_WIN="0"; else WIZ_CLAIM_WIN="1"; fi
+  echo ""
+  echo "    当前组矿机: $(wiz_miner_text)"
+  echo "      [1] 开启组矿机    [2] 关闭"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" = "1" ]; then
+    WIZ_MINER="1"
+    wiz_ask_dec "组机固定支付(USDT)" "$WIZ_MINER_USD" 1 10000
+    WIZ_MINER_USD="$REPLY"
+  else
+    WIZ_MINER="0"
+  fi
+}
+
 # ---- 账号管理 ----
 wiz_add_account() {
   local pk addr ref
@@ -543,6 +596,7 @@ wiz_defaults() {
       WIZ_ROOMS="0,1,2"; WIZ_MIN="30"; WIZ_MAX="60"; WIZ_DELAY="0"
       WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
       WIZ_CLAIM="30"; WIZ_BNB="0.005"
+      WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_CLAIM_WIN="1"
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
   esac
@@ -559,6 +613,7 @@ wiz_commit() {
   WIZ_ROOMS="$WIZ_ROOMS" WIZ_MIN="$WIZ_MIN" WIZ_MAX="$WIZ_MAX" WIZ_DELAY="$WIZ_DELAY" \
   WIZ_GAS_MODE="$WIZ_GAS_MODE" WIZ_GAS_FIXED="$WIZ_GAS_FIXED" WIZ_GAS_MAX="$WIZ_GAS_MAX" \
   WIZ_GAS_MULT="$WIZ_GAS_MULT" WIZ_CLAIM="$WIZ_CLAIM" WIZ_BNB="$WIZ_BNB" \
+  WIZ_MINER="$WIZ_MINER" WIZ_MINER_USD="$WIZ_MINER_USD" WIZ_CLAIM_WIN="$WIZ_CLAIM_WIN" \
   node -e '
     const fs = require("fs");
     let c = {};
@@ -574,6 +629,9 @@ wiz_commit() {
     c.GAS_MULT = Number(e.WIZ_GAS_MULT);
     if (e.WIZ_GAS_MODE === "fixed") c.GAS_GWEI = Number(e.WIZ_GAS_FIXED);
     else c.GAS_GWEI = null;
+    c.MINER_ENABLED = String(e.WIZ_MINER) === "1";
+    c.MINER_USD = Number(e.WIZ_MINER_USD);
+    c.CLAIM_WIN = String(e.WIZ_CLAIM_WIN) === "1";
     const tmp = "config.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(c, null, 2) + "\n");
     // rename 失败时清掉 .tmp，别在目录里留垃圾
@@ -614,7 +672,8 @@ wiz_menu() {
   echo "      [3] 抢单延迟          [4] 手续费 / Gas"
   echo "      [5] 领取返利间隔      [6] 最低 BNB 余额"
   echo "      [7] 账号管理          [8] 恢复默认值"
-  echo "      [9] 保存并退出        [0] 不保存退出"
+  echo "      [9] 中奖处理/组矿机   [10] 保存并退出"
+  echo "      [0] 不保存退出"
   echo "  ────────────────────────────────────────────────────"
 }
 
@@ -634,7 +693,8 @@ wizard_main() {
       6) wiz_edit_bnb ;;
       7) wiz_accounts ;;
       8) wiz_defaults ;;
-      9) if wiz_commit; then return 0; fi ;;
+      9) wiz_edit_miner ;;
+      10) if wiz_commit; then return 0; fi ;;
       0) echo ""; echo "  已退出，未做任何修改"; return 1 ;;
       *) ;;
     esac
