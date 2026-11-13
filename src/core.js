@@ -20,7 +20,7 @@ const path = require('path');
 const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
-const VERSION = '2.1-v8';
+const VERSION = '2.2-v8';
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
   ? 'powershell -ExecutionPolicy Bypass -File autofts.ps1'
@@ -74,12 +74,17 @@ function cfgStr(v, dflt, name) {
   return dflt;
 }
 
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+
 const CFG = {
   // v8 队列(2026-11 网站改版后的正式队列)。旧地址 0x88E6... 已降级为 legacyQueueV7，房间全部停用。
   QUEUE_ADDR: process.env.FTS_QUEUE_ADDR || cfgStr(userCfg.QUEUE_ADDR, '0xe2E751cF79A5Ce03fED12Abf15acFA7383E296bF', 'QUEUE_ADDR'),
   USDT_ADDR: process.env.FTS_USDT_ADDR || cfgStr(userCfg.USDT_ADDR, '0x55d398326f99059fF775485246999027B3197955', 'USDT_ADDR'),
   // 老系统队列: 老额度 >= 阈值后在这里 formLP 组矿机，固定 100U(与额度多少无关)
   MINER_QUEUE_ADDR: process.env.FTS_MINER_QUEUE || cfgStr(userCfg.MINER_QUEUE_ADDR, '0x94DbcCFC460FA428755F0392ff282B83696B277d', 'MINER_QUEUE_ADDR'),
+  // 矿机金库(新版 v8 / 老版)，用于领取矿机每日释放的 FTS
+  MINING_VAULT_ADDR: process.env.FTS_MINING_VAULT || cfgStr(userCfg.MINING_VAULT_ADDR, '0xeC388916991332C71548E9911A73802f0F459EC5', 'MINING_VAULT_ADDR'),
+  LEGACY_MINING_ADDR: process.env.FTS_LEGACY_MINING || cfgStr(userCfg.LEGACY_MINING_ADDR, '0xa710e7e87efc10dc4d9d22dc6446c66f0897d868', 'LEGACY_MINING_ADDR'),
   CHAIN_ID: cfgNum(process.env.FTS_CHAIN_ID ?? userCfg.CHAIN_ID, 56, 'CHAIN_ID'),
   // 房间 0=10U 1=50U 2=100U，全部启用；可用 FTS_ROOMS=0,1 缩小范围
   ROOMS: (process.env.FTS_ROOMS
@@ -159,6 +164,14 @@ const CFG = {
   MINER_MODE: String(process.env.FTS_MINER_MODE || userCfg.MINER_MODE || 'old').toLowerCase(),
   MINER_ROOM: cfgNum(process.env.FTS_MINER_ROOM ?? userCfg.MINER_ROOM, 0, 'MINER_ROOM'),
   MINER_CHECK_MS: cfgNum(process.env.FTS_MINER_CHECK_MS ?? userCfg.MINER_CHECK_MS, 60000, 'MINER_CHECK_MS'),
+  // ---- 矿机产出自动领取 ----
+  // 原则: 一旦 pending > 0 就立刻领，绝不等释放完/攒到最后一块(避免中途规则变更或遗忘)。
+  MINING_CLAIM: (() => {
+    const raw = process.env.FTS_MINING_CLAIM ?? userCfg.MINING_CLAIM;
+    if (raw === undefined || raw === null || raw === '') return true;
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
+  MINING_CLAIM_MS: cfgNum(process.env.FTS_MINING_CLAIM_MS ?? userCfg.MINING_CLAIM_MS, 45000, 'MINING_CLAIM_MS'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
@@ -234,6 +247,7 @@ function validateCfg() {
     p.push(`MINER_MODE 只能是 old/new/both，当前 "${CFG.MINER_MODE}"，已改为 old`);
     CFG.MINER_MODE = 'old';
   }
+  if (CFG.MINING_CLAIM_MS < 15000) { p.push('MINING_CLAIM_MS 太小，已改为 15000'); CFG.MINING_CLAIM_MS = 15000; }
   return p.concat(cfgProblems);
 }
 
@@ -333,6 +347,20 @@ const QUEUE_ABI = [
   'function roomCount() view returns (uint8)',
   'function allowance(address owner, address spender) view returns (uint256)' // 仅用于兼容性探测
 ];
+// 矿机金库: 新版(v8)按档位释放，pendingOf 为当前可领总额
+const MINING_V8_ABI = [
+  'function pendingOf(address) view returns (uint256)',
+  'function trancheCount(address) view returns (uint256)',
+  'function machineOf(address) view returns ((uint256 quotaUsd, uint256 releasedUsd, uint256 startDay, uint256 claimedDays, bool done)[] list, bool isActive)',
+  'function claim() returns (uint256)',
+  'function claimTranche(uint256 index) returns (uint256)'
+];
+// 老版矿机金库
+const MINING_LEGACY_ABI = [
+  'function pendingReward(address) view returns (uint256)',
+  'function machineOf(address) view returns (uint256 quotaUsd, uint256 releasedUsd, uint256 startDay, uint256 claimedDays, bool active)',
+  'function claim() returns (uint256)'
+];
 const USDT_ABI = [
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
@@ -396,6 +424,10 @@ class RpcManager {
     try {
       const p = this.makeProvider(url);
       const h = await withTimeout(p.getBlockNumber(), CFG.RPC_TIMEOUT_MS, 'getBlockNumber');
+      // 有些公共节点允许 eth_blockNumber 但屏蔽 eth_call(会报 400 / "eth_call is not supported")，
+      // 这种节点会导致预演和余额读取全挂，必须在这里筛掉。
+      const ret = await withTimeout(p.call({ to: CFG.USDT_ADDR, data: '0x313ce567' }), CFG.RPC_TIMEOUT_MS, 'eth_call');
+      if (!ret || ret === '0x') throw new Error('eth_call 返回空');
       return { url, latency: Date.now() - t0, height: h, ok: true };
     } catch (e) {
       return { url, ok: false, error: e };
@@ -490,6 +522,25 @@ function bind(inst, provider) {
   inst.queue = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, inst.wallet);
   inst.usdt = new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, inst.wallet);
   inst.miner = new ethers.Contract(CFG.MINER_QUEUE_ADDR, QUEUE_ABI, inst.wallet);
+  inst.mining = new ethers.Contract(CFG.MINING_VAULT_ADDR, MINING_V8_ABI, inst.wallet);
+  inst.legacyMining = new ethers.Contract(CFG.LEGACY_MINING_ADDR, MINING_LEGACY_ABI, inst.wallet);
+}
+
+// 推荐人解析: 配置里没填/填 0 时，读链上 referrerOfV2(已绑定的推荐关系)自动补全
+async function resolveReferrer(inst) {
+  if (inst.referrer && inst.referrer.toLowerCase() !== ZERO_ADDR) return inst.referrer;
+  try {
+    const r = await mgr.rpc(p => inst.queue.referrerOfV2(inst.address));
+    if (r && r.toLowerCase() !== ZERO_ADDR) {
+      inst.referrer = r;
+      info(inst.address, `推荐人自动识别成功: ${r}（来自链上绑定关系）`);
+      return r;
+    }
+  } catch (e) {
+    warnOnce(inst.address, '推荐人自动识别失败(不影响入场): ' + formatError(e).slice(0, 100), 300000);
+  }
+  inst.referrer = ZERO_ADDR;
+  return ZERO_ADDR;
 }
 mgr.onRotate(p => instances.forEach(i => bind(i, p)));
 
@@ -1456,6 +1507,57 @@ async function minerLoop(inst) {
   }
 }
 
+async function readMiningPending(inst, v) {
+  try {
+    return BigInt(await mgr.rpc(p => v.c[v.fn](inst.address)));
+  } catch (e) {
+    // 没矿机时老版合约会直接 revert(无 revert data)，属正常状态，按 0 处理
+    if (e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null) return 0n;
+    throw e;
+  }
+}
+
+// ---------------- 矿机产出领取 ----------------
+// 原则: 只要 pending > 0 就立刻领，绝不等"释放完/攒到最后一块"再领。
+// 规则随时可能调整、私钥可能丢、gas 可能涨——早领早落袋。
+async function miningClaimLoop(inst) {
+  if (!CFG.MINING_CLAIM) return;
+  const vaults = [
+    { key: 'v8', label: '新版矿机', c: inst.mining, fn: 'pendingOf' },
+    { key: 'legacy', label: '老版矿机', c: inst.legacyMining, fn: 'pendingReward' }
+  ];
+  const lastAt = { v8: 0, legacy: 0 };
+  const minBnb = ethers.parseEther(String(CFG.MIN_BNB_GAS));
+  while (true) {
+    for (const v of vaults) {
+      try {
+        const pending = await readMiningPending(inst, v);
+        if (BigInt(pending) <= 0n) continue;
+        const now = Date.now();
+        // 同一笔产出 90 秒内不重复提交(交易未上链时 pendingOf 仍是旧值)
+        if (now - lastAt[v.key] < 90000) continue;
+        const bnb = await mgr.rpc(p => inst.provider.getBalance(inst.address));
+        if (bnb < minBnb) {
+          warnOnce(inst.address, `[${v.label}] 可领 ${ethers.formatUnits(pending, 18)} FTS，但 BNB 不足付 gas，跳过`, 600000);
+          continue;
+        }
+        info(inst.address, `[${v.label}] 检测到可领取 ${ethers.formatUnits(pending, 18)} FTS，立即领取`);
+        const okTx = await sendTx(inst, {
+          label: `[${v.label}] 领取矿机产出 ${ethers.formatUnits(pending, 18)} FTS`,
+          contract: v.c,
+          method: 'claim',
+          args: [],
+          noWait: true
+        });
+        if (okTx) lastAt[v.key] = now;
+      } catch (e) {
+        errOnce(inst.address, `[${v.label}] 领取产出失败: ` + formatError(e), 120000);
+      }
+    }
+    await sleep(CFG.MINING_CLAIM_MS + Math.random() * 6000);
+  }
+}
+
 // ---------------- 自检 ----------------
 let selftestWallets = [];
 async function selftest() {
@@ -1565,6 +1667,24 @@ async function selftest() {
     }
     if (allow === 0n) console.log('   ⚠️ 授权为 0，首次入场会自动发起"单轮票价"授权交易');
     // 老系统矿机额度: 只有达到房间阈值才能 formLP 组机(与中奖无关，靠历史中奖累积)
+    if (CFG.MINING_CLAIM) {
+      try {
+        const mv = new ethers.Contract(CFG.MINING_VAULT_ADDR, MINING_V8_ABI, mgr.provider);
+        const lm = new ethers.Contract(CFG.LEGACY_MINING_ADDR, MINING_LEGACY_ABI, mgr.provider);
+        const [pv, pl] = await Promise.all([
+          mv.pendingOf(w.ADDRESS),
+          lm.pendingReward(w.ADDRESS).catch(e => {
+            if (e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null) return 0n;
+            throw e;
+          })
+        ]);
+        console.log(`   矿机产出: 新版可领 ${ethers.formatUnits(pv, 18)} FTS / 老版可领 ${ethers.formatUnits(pl, 18)} FTS` +
+          (BigInt(pv) + BigInt(pl) > 0n ? '（>0 会立即领取）' : ''));
+      } catch (e) {
+        console.log('   矿机产出读取失败: ' + formatError(e));
+      }
+    }
+
     if (CFG.MINER_ENABLED) {
       for (const t of minerTargets()) {
         try {
@@ -1673,7 +1793,7 @@ async function main() {
     ? `固定 ${CFG.GAS_FIXED_GWEI} gwei`
     : `自动 ×${CFG.GAS_MULT} (上限 ${CFG.GAS_MAX_GWEI} gwei)`;
   info('SYS', `FTS 引擎 v${VERSION} 启动 | 模式=${MODE} | 房间=${CFG.ROOMS.join(',')} | 抢位=[${CFG.SNIPE_MIN_COUNT},${CFG.SNIPE_MAX_COUNT}) | 延迟=${CFG.SNIPE_DELAY_MS}ms | 手续费=${gasDesc}`);
-  info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `${CFG.MINER_MODE}(固定${CFG.MINER_USD}U/老队列 ${CFG.MINER_QUEUE_ADDR})` : '关'}`);
+  info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `${CFG.MINER_MODE}(固定${CFG.MINER_USD}U/老队列 ${CFG.MINER_QUEUE_ADDR})` : '关'} | 矿机产出领取=${CFG.MINING_CLAIM ? `开(每${Math.round(CFG.MINING_CLAIM_MS / 1000)}s检测)` : '关'}`);
   const wallets = loadWallets();
   if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); exitFlush(21); return; }
   try { fs.chmodSync(WALLETS_FILE, 0o600); } catch (e) { }
@@ -1703,12 +1823,14 @@ async function main() {
   }
 
   // 排水并行做: 串行时 10 个账号最坏要等 5 分钟才能开始抢第一单
+  await Promise.all(instances.map(i => resolveReferrer(i)));
   await Promise.all(instances.map(i => drainPending(i)));
 
   for (const inst of instances) {
     startGapFixer(inst);   // nonce 断档自愈
     claimLoop(inst);
     if (CFG.MINER_ENABLED) minerLoop(inst);
+    if (CFG.MINING_CLAIM) miningClaimLoop(inst);
   }
 
   const stream = new BlockStream();

@@ -152,6 +152,8 @@ function Show-Usage {
   GAS_GWEI           固定 gas 价，默认 0.05；写 null 则改为自动(按链上价 x GAS_MULT)
   CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 30000
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
+  MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
+  MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
 '@
     exit 0
 }
@@ -636,6 +638,34 @@ function Edit-Miner {
     }
 }
 
+function Get-AutoReferrer {
+    param([string]$Addr)
+    $code = @'
+const { JsonRpcProvider, Contract } = require("ethers");
+(async () => {
+  const addr = require("fs").readFileSync(0, "utf8").trim();
+  const abi = ["function referrerOfV2(address) view returns (address)"];
+  for (const u of ["https://bsc-rpc.publicnode.com", "https://1rpc.io/bnb"]) {
+    try {
+      const p = new JsonRpcProvider(u, 56, { staticNetwork: true });
+      const c = new Contract("0xe2E751cF79A5Ce03fED12Abf15acFA7383E296bF", abi, p);
+      const r = await Promise.race([
+        c.referrerOfV2(addr),
+        new Promise((_, j) => setTimeout(() => j(new Error("timeout")), 12000))
+      ]);
+      console.log(r);
+      process.exit(0);
+    } catch (e) {}
+  }
+  console.log("");
+})();
+'@
+    $out = Invoke-NodeJs 'ref-detect' $code $Addr
+    $line = @($out | Where-Object { $_ -match '^0x[a-fA-F0-9]{40}$' } | Select-Object -Last 1)
+    if ($line.Count -gt 0) { return [string]$line[0] }
+    return ''
+}
+
 function Add-Account {
     Show-WizHeader
     Write-Host "    ---- 添加账号 ----"
@@ -677,14 +707,28 @@ function Add-Account {
         Write-WarnMsg "地址格式错误"
     }
     $ref = ''
+    $zeroRef = '0x0000000000000000000000000000000000000000'
+    Write-Host "    推荐人地址: 直接回车 = 自动检测链上绑定；确认没有推荐人可填 $zeroRef"
     while ($true) {
-        $ref = "$(Read-Host '    推荐人地址 (0x开头)')".Trim()
+        $ref = "$(Read-Host '    推荐人地址 [自动检测]')".Trim()
         if ($pipeMode -and [string]::IsNullOrWhiteSpace($ref)) {
             $eof++
             if ($eof -ge 3) { Write-Die "输入已结束(EOF)，配置向导退出" }
         } else { $eof = 0 }
+        if ([string]::IsNullOrWhiteSpace($ref)) {
+            Write-Host "    正在链上查询推荐关系..."
+            $auto = Get-AutoReferrer $addr
+            if ($auto -match '^0x[a-fA-F0-9]{40}$' -and $auto.ToLower() -ne $zeroRef) {
+                $ref = $auto
+                Write-Ok "已自动识别推荐人: $ref"
+            } else {
+                Write-WarnMsg "链上没有已绑定的推荐人，将使用零地址（无推荐人）"
+                $ref = $zeroRef
+            }
+            break
+        }
         if ($ref -match '^0x[a-fA-F0-9]{40}$') { break }
-        Write-WarnMsg "推荐人地址格式错误"
+        Write-WarnMsg "地址格式错误（0x + 40 位十六进制），或直接回车自动检测"
     }
 
     # 私钥不放进环境变量(同用户可用 Process Explorer / WMI 读到)，改从 stdin 传

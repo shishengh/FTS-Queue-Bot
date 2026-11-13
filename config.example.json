@@ -12,5 +12,7 @@
   "MINER_ENABLED": false,
   "MINER_MODE": "old",
   "MINER_USD": 100,
-  "MINER_ROOM": 0
+  "MINER_ROOM": 0,
+  "MINING_CLAIM": true,
+  "MINING_CLAIM_MS": 45000
 }

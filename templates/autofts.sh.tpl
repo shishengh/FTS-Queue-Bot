@@ -48,6 +48,8 @@ usage() {
   GAS_GWEI           固定 gas 价，默认 0.05；写 null 则改为自动(按链上价 × GAS_MULT)
   CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 30000
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
+  MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
+  MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
 HELP
   exit 0
 }
@@ -194,17 +196,53 @@ case "${PREFIX:-}" in *com.termux*) IS_TERMUX=1 ;; esac
 if [ "$IS_TERMUX" = 1 ]; then ok_msg "Termux 环境 ($PREFIX)"; else echo "非 Termux 环境，按通用 Linux 处理"; fi
 
 # --- Node.js ---
-if ! command -v node >/dev/null 2>&1; then
-  warn_msg "未找到 Node.js，尝试安装..."
-  if [ "$IS_TERMUX" = 1 ] && command -v pkg >/dev/null 2>&1; then
-    pkg install nodejs-lts -y || die "Node.js 安装失败，请手动执行: pkg install nodejs-lts"
+# 能执行且输出 vX.Y.Z 才算可用。Termux 升级后常见 "CANNOT LINK EXECUTABLE ... cannot locate symbol"，
+# 这种情况下 `node -v` 返回非 0，绝不能当成"版本过低"。
+node_ok() {
+  local out
+  out="$(node -v 2>&1)" || return 1
+  case "$out" in v[0-9]*) return 0 ;; *) return 1 ;; esac
+}
+termux_install_node() {
+  local i
+  for i in 1 2 3; do
+    echo "  正在安装 nodejs-lts（第 $i 次）..."
+    # 先刷新索引: 镜像刚同步时 Packages.bz2 大小对不上，刷新一次往往就能过
+    pkg update -y >/dev/null 2>&1 || true
+    if pkg install -y nodejs-lts; then
+      node_ok && return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+if ! command -v node >/dev/null 2>&1 || ! node_ok; then
+  if command -v node >/dev/null 2>&1; then
+    warn_msg "node 存在但无法运行（Termux 升级后 ABI 不匹配很常见）："
+    node -v 2>&1 | head -1 | sed 's/^/    /' || true
   else
-    die "未找到 Node.js。Termux 请执行: pkg install nodejs-lts"
+    warn_msg "未找到 Node.js，尝试安装..."
+  fi
+  if [ "$IS_TERMUX" = 1 ] && command -v pkg >/dev/null 2>&1; then
+    if ! termux_install_node; then
+      echo ""
+      echo "  Node.js 自动安装失败。Termux 镜像有时同步不完整（提示"
+      echo "  \"File has unexpected size / Mirror sync in progress\"），这不是脚本的问题。手动三步："
+      echo "    1) termux-change-repo          # 换一个镜像，如清华 / 北外"
+      echo "    2) pkg update && pkg upgrade -y"
+      echo "    3) pkg install -y nodejs-lts   # 仍报损坏则: pkg reinstall nodejs-lts"
+      die "Node.js 不可用，请先完成上面三步"
+    fi
+  else
+    die "未找到可用的 Node.js。请安装 Node 18+ 后重试"
   fi
 fi
 NODE_MAJOR="$(node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
-if [ -z "${NODE_MAJOR:-}" ] || [ "$NODE_MAJOR" -lt 18 ]; then
-  die "Node 版本过低 ($(node -v))，需要 >= 18。Termux: pkg install nodejs-lts"
+if [ -z "${NODE_MAJOR:-}" ] || [ "$NODE_MAJOR" -lt 18 ] 2>/dev/null; then
+  die "Node 版本过低 ($(node -v 2>&1))，需要 >= 18。Termux: pkg install -y nodejs-lts"
+fi
+if ! command -v npm >/dev/null 2>&1 || ! npm -v >/dev/null 2>&1; then
+  warn_msg "npm 不可用（Termux 升级后可能同样损坏）。若依赖安装失败请执行: pkg reinstall nodejs-lts"
 fi
 ok_msg "Node $(node -v) / npm $(npm -v 2>/dev/null || echo '?')"
 
@@ -521,6 +559,30 @@ wiz_edit_miner() {
   fi
 }
 
+# ---- 推荐人自动检测(读链上 referrerOfV2) ----
+detect_referrer() {
+  printf '%s' "$1" | node -e '
+const { JsonRpcProvider, Contract } = require("ethers");
+(async () => {
+  const addr = require("fs").readFileSync(0, "utf8").trim();
+  const abi = ["function referrerOfV2(address) view returns (address)"];
+  for (const u of ["https://bsc-rpc.publicnode.com", "https://1rpc.io/bnb"]) {
+    try {
+      const p = new JsonRpcProvider(u, 56, { staticNetwork: true });
+      const c = new Contract("0xe2E751cF79A5Ce03fED12Abf15acFA7383E296bF", abi, p);
+      const r = await Promise.race([
+        c.referrerOfV2(addr),
+        new Promise((_, j) => setTimeout(() => j(new Error("timeout")), 12000))
+      ]);
+      console.log(r);
+      process.exit(0);
+    } catch (e) { }
+  }
+  console.log("");
+})();
+' 2>/dev/null
+}
+
 # ---- 账号管理 ----
 wiz_add_account() {
   local pk addr ref
@@ -540,10 +602,23 @@ wiz_add_account() {
     if [[ "$addr" =~ ^0x[a-fA-F0-9]{40}$ ]]; then break; fi
     warn_msg "地址格式错误"
   done
+  echo "    推荐人地址: 直接回车 = 自动检测链上绑定；确认没有推荐人可填 0x0000000000000000000000000000000000000000"
   while true; do
-    read -r -p "    推荐人地址 (0x开头): " ref || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    read -r -p "    推荐人地址 [自动检测]: " ref || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    ref="${ref// /}"
+    if [ -z "$ref" ]; then
+      echo "    正在链上查询推荐关系..."
+      ref="$(detect_referrer "$addr")"
+      if [[ "$ref" =~ ^0x[a-fA-F0-9]{40}$ ]] && [ "${ref,,}" != "0x0000000000000000000000000000000000000000" ]; then
+        ok_msg "已自动识别推荐人: $ref"
+      else
+        warn_msg "链上没有已绑定的推荐人，将使用零地址（无推荐人）"
+        ref="0x0000000000000000000000000000000000000000"
+      fi
+      break
+    fi
     if [[ "$ref" =~ ^0x[a-fA-F0-9]{40}$ ]]; then break; fi
-    warn_msg "推荐人地址格式错误"
+    warn_msg "地址格式错误（0x + 40 位十六进制），或直接回车自动检测"
   done
   # 不再写入每个账号独立的抢位设置，统一由引导页的全局配置控制。
   # 私钥不放进环境变量(同用户可通过 /proc/<pid>/environ 读到)，改从 stdin 传
